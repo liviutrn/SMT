@@ -1,0 +1,37 @@
+name: Build SnowRunner Unified SMT bridge
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/unified-app-bridge
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build Release x64
+        shell: powershell
+        run: msbuild "SnowRunner Manual Transmission.sln" /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+      - name: Publish unified app
+        shell: powershell
+        run: |
+          dotnet publish "SnowRunnerUnifiedApp/SnowRunnerUnified.csproj" -c Release -r win-x64 --self-contained true -o "package" -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false
+          Copy-Item "x64/Release/SMT.asi" "package/SMT.asi"
+      - name: Upload SMT bridge
+        uses: actions/upload-artifact@v4
+        with:
+          name: SMT-unified-bridge
+          path: |
+            x64/Release/SMT.asi
+            x64/Release/SMT.pdb
+      - name: Upload unified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnowRunnerUnified-win-x64
+          path: package/

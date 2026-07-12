@@ -8,7 +8,38 @@ std::atomic<float> currentCoef = 1.05f;
 
 std::unordered_map <Vehicle*, std::atomic<bool>> IsInAuto{};
 
+namespace {
+	void ApplyPedalIdleTakeoff(Vehicle* veh) {
+		idleTakeoffRequest = 0.0f;
+		if (!iniConfig["OPTIONS"]["PEDAL IDLE TAKEOFF"].as<bool>() ||
+			veh->TruckAction->Gear_1 == 0 || clutchPowerFactor.load() <= 0.0f ||
+			clutchPedalAmount.load() <= 0.02f) return;
+		const float physicalThrottle = throttlePedalAmount.load();
+		const float idleThrottle = std::clamp(iniConfig["CLUTCH"]["IDLE THROTTLE"].as<float>(), 0.0f, 0.50f);
+		if (physicalThrottle >= 0.0f && physicalThrottle < idleThrottle) {
+			veh->TruckAction->Accel = std::max(veh->TruckAction->Accel, idleThrottle);
+			idleTakeoffRequest = idleThrottle;
+		}
+	}
+}
+
 void Vehicle::SetPowerCoef(float coef) { Hooked_SetPowerCoef(this, coef); }
+void Vehicle::RefreshPowerCoef() {
+	float coef = IsInAuto[this] ? 1.05f : currentCoef.load();
+	if (iniConfig["OPTIONS"]["ANALOG CLUTCH"].as<bool>()) {
+		coef *= clutchPowerFactor.load();
+	}
+	// Clutch travel changes torque only. Do not call Hooked_SetPowerCoef here:
+	// that hook reapplies the selected gear and causes driveline jolts.
+	ApplyPedalIdleTakeoff(this);
+	SetPowerCoefO(this, coef);
+}
+
+bool Vehicle::ShiftClutchGear(std::int32_t targetGear) {
+	const bool switched = Hooked_ShiftGear(this, targetGear);
+	if (switched) RefreshPowerCoef();
+	return switched;
+}
 
 std::int32_t Vehicle::GetMaxGear() const {
 	return GetMaxGearO(this);
@@ -160,6 +191,10 @@ void Hooked_SetPowerCoef(Vehicle* veh, float coef) {
 	if (IsInAuto[veh]) {
 		coef = 1.05;
 	}
+	if (iniConfig["OPTIONS"]["ANALOG CLUTCH"].as<bool>()) {
+		coef *= clutchPowerFactor.load();
+	}
+	ApplyPedalIdleTakeoff(veh);
 	SetPowerCoefO(veh, coef);
 	ShiftGearO(veh, veh->TruckAction->Gear_2);
 }

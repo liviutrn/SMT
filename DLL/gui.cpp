@@ -288,6 +288,21 @@ HRESULT __stdcall hookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, U
 		}
 		ImGui::SameLine();
 		ImGui::Text("To change keybind left click on it, press desired keys/buttons/axis and right click to confirm. Use right click to clear a keybind.");
+		float biteStart = iniConfig["CLUTCH"]["BITE START"].as<float>();
+		float biteEnd = iniConfig["CLUTCH"]["BITE END"].as<float>();
+		float curve = iniConfig["CLUTCH"]["CURVE"].as<float>();
+		float idleThrottle = iniConfig["CLUTCH"]["IDLE THROTTLE"].as<float>();
+		if (ImGui::SliderFloat("Bite start", &biteStart, 0.0f, 0.95f, "%.2f")) iniConfig["CLUTCH"]["BITE START"] = biteStart;
+		if (ImGui::SliderFloat("Bite end", &biteEnd, 0.05f, 1.0f, "%.2f")) iniConfig["CLUTCH"]["BITE END"] = biteEnd;
+		if (ImGui::SliderFloat("Engagement curve", &curve, 0.50f, 8.0f, "%.2f")) iniConfig["CLUTCH"]["CURVE"] = curve;
+		if (ImGui::SliderFloat("Pedal idle throttle", &idleThrottle, 0.0f, 0.50f, "%.2f")) iniConfig["CLUTCH"]["IDLE THROTTLE"] = idleThrottle;
+		const float clutchLive = clutchPedalAmount.load();
+		const float throttleLive = throttlePedalAmount.load();
+		if (clutchLive >= 0.0f) ImGui::Text("Clutch pedal (pressed): %.3f", clutchLive);
+		else ImGui::Text("Clutch pedal (pressed): n/a");
+		if (throttleLive >= 0.0f) ImGui::Text("Throttle pedal (pressed): %.3f", throttleLive);
+		else ImGui::Text("Throttle pedal (pressed): n/a");
+		ImGui::Text("Pedal idle request: %.3f", idleTakeoffRequest.load());
 		//ImGui::SameLine();
 		//ImGui::InvisibleButton("##debug_separator", ImVec2(width * 0.43f, ImGui::GetItemRectSize().y));
 		//ImGui::SameLine();
