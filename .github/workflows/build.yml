@@ -1,0 +1,24 @@
+name: Build SnowRunner Unified SMT bridge
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/unified-app-bridge
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build Release x64
+        shell: powershell
+        run: msbuild "SnowRunner Manual Transmission.sln" /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+      - name: Upload SMT bridge
+        uses: actions/upload-artifact@v4
+        with:
+          name: SMT-unified-bridge
+          path: |
+            x64/Release/SMT.asi
+            x64/Release/SMT.pdb

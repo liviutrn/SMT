@@ -36,3 +36,7 @@ extern std::vector<OIS::JoyStick*> joystickList;
 extern std::set<std::string> tempPressed;
 extern std::atomic<bool> keepAliveInput;
 extern std::atomic<int32_t> range;
+extern std::atomic<float> clutchPowerFactor;
+extern std::atomic<float> clutchPedalAmount;
+extern std::atomic<float> throttlePedalAmount;
+extern std::atomic<float> idleTakeoffRequest;
