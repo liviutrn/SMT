@@ -1,0 +1,92 @@
+name: OFXR 4x prototype
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ofxr-4x-prototype
+    paths:
+      - 'ofxr4x/**'
+      - '.github/workflows/ofxr-4x-prototype.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout public build workspace
+        uses: actions/checkout@v4
+
+      - name: Clone pinned OFXR Bridge
+        shell: pwsh
+        run: |
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src
+          cd ofxr-src
+          git checkout dad56acafc6e1dde219940427738b926cf2ea555
+
+      - name: Apply 4x prototype patch
+        shell: pwsh
+        run: |
+          python ofxr4x/ofxr4x_patch.py ofxr-src
+          cd ofxr-src
+          git diff --check
+          git diff > ../OFXR-4X-Prototype.patch
+
+      - name: Prepare FidelityFX Optical Flow
+        shell: pwsh
+        run: |
+          cd ofxr-src
+          git clone --branch v1.1.4 --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/FidelityFX-SDK-v1.1.4
+          cmake -S external/FidelityFX-SDK-v1.1.4/sdk -B build-fidelityfx -G "Visual Studio 17 2022" -A x64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          cmake --build build-fidelityfx --config Release --parallel 4
+
+      - name: Configure OFXR
+        shell: pwsh
+        run: |
+          cd ofxr-src
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DXRFG_BUILD_TESTS=OFF
+
+      - name: Build OFXR Release
+        shell: pwsh
+        run: |
+          cd ofxr-src
+          cmake --build build --config Release --parallel 4
+
+      - name: Package prototype
+        shell: pwsh
+        run: |
+          $root = Join-Path $PWD 'package\OFXR-Bridge-4X-Prototype'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item 'ofxr-src\build\Release\OFXRBridgeTray.exe' $root
+          Copy-Item 'ofxr-src\build\Release\ofxr' $root -Recurse
+          Copy-Item 'OFXR-4X-Prototype.patch' $root
+          @"
+          OFXR Bridge 4x prototype
+          Base: tig3rmast3r/OFXR-Bridge dad56acafc6e1dde219940427738b926cf2ea555
+
+          Prototype behavior:
+          - NVIDIA Optical Flow backend only for the new 4x path.
+          - One A/B optical-flow calculation is reused for three synthetic outputs.
+          - Synthetic temporal positions: 0.25, 0.50, 0.75.
+          - Presenter order: fake25 -> fake50 -> fake75 -> real B.
+          - NVIDIA application pacing is 4x the physical display period.
+          - Existing 2x midpoint path remains for fallback/non-NVIDIA behavior.
+          - D3D11 applications use the existing D3D11/D3D12 interop path for all three generated frames.
+
+          TEST BUILD. Keep your known-working OFXR installation available for rollback.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $root 'README-4X-PROTOTYPE.txt')
+          Compress-Archive -Path "$root\*" -DestinationPath 'OFXR-Bridge-4X-Prototype.zip' -Force
+
+      - name: Upload prototype
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-Bridge-4X-Prototype
+          path: |
+            OFXR-Bridge-4X-Prototype.zip
+            OFXR-4X-Prototype.patch
+          if-no-files-found: error
+          retention-days: 14
