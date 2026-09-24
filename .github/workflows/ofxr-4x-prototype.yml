@@ -25,6 +25,8 @@ jobs:
       - name: Clone pinned OFXR Bridge
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src
           cd ofxr-src
           git checkout dad56acafc6e1dde219940427738b926cf2ea555
@@ -32,6 +34,9 @@ jobs:
       - name: Apply 4x prototype patch
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')"
           python ofxr4x/ofxr4x_patch.py ofxr-src
           cd ofxr-src
           git diff --check
@@ -40,26 +45,33 @@ jobs:
       - name: Prepare FidelityFX Optical Flow
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cd ofxr-src
           git clone --branch v1.1.4 --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/FidelityFX-SDK-v1.1.4
-          cmake -S external/FidelityFX-SDK-v1.1.4/sdk -B build-fidelityfx -G "Visual Studio 17 2022" -A x64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          cmake -S external/FidelityFX-SDK-v1.1.4/sdk -B build-fidelityfx -G "Visual Studio 18 2026" -A x64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
           cmake --build build-fidelityfx --config Release --parallel 4
 
       - name: Configure OFXR
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cd ofxr-src
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DXRFG_BUILD_TESTS=OFF
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DXRFG_BUILD_TESTS=OFF
 
       - name: Build OFXR Release
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cd ofxr-src
           cmake --build build --config Release --parallel 4
 
       - name: Package prototype
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $root = Join-Path $PWD 'package\OFXR-Bridge-4X-Prototype'
           New-Item -ItemType Directory -Force -Path $root | Out-Null
           Copy-Item 'ofxr-src\build\Release\OFXRBridgeTray.exe' $root
