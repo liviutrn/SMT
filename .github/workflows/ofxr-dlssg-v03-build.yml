@@ -30,7 +30,21 @@ jobs:
           if ($hash -ne $expected) { throw "POC package hash mismatch: expected $expected, got $hash" }
           $pkg = Join-Path $env:RUNNER_TEMP 'poc'
           Expand-Archive -Path $zip -DestinationPath $pkg -Force
-          py -m py_compile (Join-Path $pkg 'OFXR_DLSSG_POC_v0.3/apply_dlssg_poc.py')
+          $root = Join-Path $pkg 'OFXR_DLSSG_POC_v0.3'
+          # Final static-audit hotfix: HLSL GeneratedFrame is t2, so the copy
+          # root descriptor must also start at t2. Verify the exact resulting
+          # source hash before compiling so this cannot silently drift.
+          $cpp = Join-Path $root 'files/src/d3d12/dlssg_poc.cpp'
+          $text = Get-Content -Raw $cpp
+          if (!$text.Contains('copy_srv.BaseShaderRegister = 1;')) { throw 'Expected pre-hotfix t1 root binding not found' }
+          $text = $text.Replace('// Copy root: generated frame SRV at t1.', '// Copy root: generated frame SRV at t2 (matches dlssg_poc.hlsl).')
+          $text = $text.Replace('copy_srv.BaseShaderRegister = 1;', 'copy_srv.BaseShaderRegister = 2;')
+          Set-Content -Path $cpp -Value $text -NoNewline -Encoding utf8
+          $cppHash = (Get-FileHash $cpp -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedCpp = 'a64919abd5ff76a5a9416c90bd949b7f7a4f6d46e90ed457d1db936880b4e37c'
+          if ($cppHash -ne $expectedCpp) { throw "Corrected dlssg_poc.cpp hash mismatch: $cppHash" }
+          Add-Content -Path (Join-Path $root 'AUDIT.md') -Value "`n### Final t2 root-binding correction`nThe final Windows build maps the generated-frame descriptor table to t2, matching the HLSL declaration. Corrected source SHA-256: $cppHash.`n"
+          py -m py_compile (Join-Path $root 'apply_dlssg_poc.py')
           if ($LASTEXITCODE -ne 0) { throw "POC patcher Python syntax check failed" }
 
       - name: Clone exact OFXR base
