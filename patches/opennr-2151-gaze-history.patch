@@ -1,0 +1,1256 @@
+diff --git a/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl b/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl
+new file mode 100644
+index 0000000..1c28c8b
+--- /dev/null
++++ b/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl
+@@ -0,0 +1,17 @@
++cbuffer CropMotion : register(b0)
++{
++	uint2 Extent;
++	float2 OriginOffset;
++};
++Texture2D<float2> Source : register(t0);
++RWTexture2D<float2> Output : register(u0);
++
++[numthreads(8, 8, 1)]
++void main(uint3 id : SV_DispatchThreadID)
++{
++	if (any(id.xy >= Extent))
++		return;
++	float2 motion = Source.Load(int3(id.xy, 0));
++	bool invalid = any(!isfinite(motion)) || any(asuint(motion) == 0x00800000u);
++	Output[id.xy] = invalid ? motion : motion + OriginOffset;
++}
+diff --git a/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl b/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl
+index 1cb43bf..30b9cbc 100644
+--- a/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl
++++ b/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl
+@@ -24,6 +24,9 @@ cbuffer BlendCB : register(b0)
+ 	float MaskRadiusX;     // Subrect-local oval radii, in pixels
+ 	float MaskRadiusY;
+ 	float _pad0;
++	float OriginalColour;
++	float OriginalBrightness;
++	float2 padding;
+ };
+ 
+ Texture2D<float4> SrcTex : register(t0);    // DLSS subrect output
+@@ -73,6 +76,19 @@ float FalloffAlpha(float normalizedDistance, float curve)
+ 	uint2 dstPos = uint2(tid.x + DstOffsetX, tid.y + DstOffsetY);
+ 
+ 	float4 dlss = SrcTex.Load(int3(srcPos, 0));
++	if (OriginalColour > 0.0 || OriginalBrightness > 0.0) {
++		float3 original = DstTex[dstPos].rgb;
++		const float3 lumaWeights = float3(0.2126, 0.7152, 0.0722);
++		float originalY = dot(original, lumaWeights);
++		float neuralY = dot(dlss.rgb, lumaWeights);
++		float3 chroma = lerp(dlss.rgb - neuralY, original - originalY, saturate(OriginalColour));
++		dlss.rgb = saturate(chroma + lerp(neuralY, originalY, saturate(OriginalBrightness)));
++	}
++	if (BlendMode == 2) {
++		DstTex[dstPos] = dlss;
++		return;
++	}
++
+ 
+ 	// Distance from the selected mask edge in subrect-local space.
+ 	//
+diff --git a/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/RCAS/RCAS.hlsl b/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/RCAS/RCAS.hlsl
+index 382adea..49c0a07 100644
+--- a/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/RCAS/RCAS.hlsl
++++ b/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/RCAS/RCAS.hlsl
+@@ -26,7 +26,9 @@
+ cbuffer RCASConfig : register(b0)
+ {
+ 	float sharpness;
+-	float3 pad;
++	float detailGain;
++	uint stereo;
++	uint pad;
+ };
+ 
+ Texture2D<float4> Source : register(t0);
+@@ -44,11 +46,23 @@ RWTexture2D<float4> Dest : register(u0);
+ 	//  d e f
+ 	//    h
+ 	int2 sp = int2(DTid.xy);
+-	float3 b = Source.Load(int3(sp + int2(0, -1), 0)).rgb;
+-	float3 d = Source.Load(int3(sp + int2(-1, 0), 0)).rgb;
+-	float3 e = Source.Load(int3(sp, 0)).rgb;
+-	float3 f = Source.Load(int3(sp + int2(1, 0), 0)).rgb;
+-	float3 h = Source.Load(int3(sp + int2(0, 1), 0)).rgb;
++	int eyeWidth = stereo != 0 ? int(texDim.x / 2) : int(texDim.x);
++	int eyeLeft = stereo != 0 && sp.x >= eyeWidth ? eyeWidth : 0;
++	int2 lo = int2(eyeLeft, 0);
++	int2 hi = int2(eyeLeft + eyeWidth - 1, int(texDim.y) - 1);
++	float4 center = Source.Load(int3(sp, 0));
++	float3 b = Source.Load(int3(clamp(sp + int2(0, -1), lo, hi), 0)).rgb;
++	float3 d = Source.Load(int3(clamp(sp + int2(-1, 0), lo, hi), 0)).rgb;
++	float3 e = center.rgb;
++	float3 f = Source.Load(int3(clamp(sp + int2(1, 0), lo, hi), 0)).rgb;
++	float3 h = Source.Load(int3(clamp(sp + int2(0, 1), lo, hi), 0)).rgb;
++	float3 peak = max(max(max(b, d), max(e, f)), h);
++	float normalization = max(1.0, max(peak.r, max(peak.g, peak.b)));
++	b = max(b, 0.0) / normalization;
++	d = max(d, 0.0) / normalization;
++	e = max(e, 0.0) / normalization;
++	f = max(f, 0.0) / normalization;
++	h = max(h, 0.0) / normalization;
+ 
+ 	// Rename (32-bit) or regroup (16-bit).
+ 	float bR = b.r;
+@@ -76,7 +90,7 @@ RWTexture2D<float4> Dest : register(u0);
+ 
+ 	// Noise detection.
+ 	float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+-	nz = saturate(abs(nz) * rcp(max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL)));
++	nz = saturate(abs(nz) * rcp(max(1e-6, max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL))));
+ 	nz = -0.5 * nz + 1.0;
+ 
+ 	// Min and max of ring.
+@@ -91,12 +105,12 @@ RWTexture2D<float4> Dest : register(u0);
+ 	float2 peakC = float2(1.0, -1.0 * 4.0);
+ 
+ 	// Limiters, these need to be high precision RCPs.
+-	float hitMinR = min(mn4R, eR) * rcp(4.0 * mx4R);
+-	float hitMinG = min(mn4G, eG) * rcp(4.0 * mx4G);
+-	float hitMinB = min(mn4B, eB) * rcp(4.0 * mx4B);
+-	float hitMaxR = (peakC.x - max(mx4R, eR)) * rcp(4.0 * mn4R + peakC.y);
+-	float hitMaxG = (peakC.x - max(mx4G, eG)) * rcp(4.0 * mn4G + peakC.y);
+-	float hitMaxB = (peakC.x - max(mx4B, eB)) * rcp(4.0 * mn4B + peakC.y);
++	float hitMinR = min(mn4R, eR) * rcp(max(1e-6, 4.0 * mx4R));
++	float hitMinG = min(mn4G, eG) * rcp(max(1e-6, 4.0 * mx4G));
++	float hitMinB = min(mn4B, eB) * rcp(max(1e-6, 4.0 * mx4B));
++	float hitMaxR = (peakC.x - max(mx4R, eR)) * rcp(min(-1e-6, 4.0 * mn4R + peakC.y));
++	float hitMaxG = (peakC.x - max(mx4G, eG)) * rcp(min(-1e-6, 4.0 * mn4G + peakC.y));
++	float hitMaxB = (peakC.x - max(mx4B, eB)) * rcp(min(-1e-6, 4.0 * mn4B + peakC.y));
+ 	float lobeR = max(-hitMinR, hitMaxR);
+ 	float lobeG = max(-hitMinG, hitMaxG);
+ 	float lobeB = max(-hitMinB, hitMaxB);
+@@ -111,5 +125,6 @@ RWTexture2D<float4> Dest : register(u0);
+ 	float pixG = (lobe * bG + lobe * dG + lobe * hG + lobe * fG + eG) * rcpL;
+ 	float pixB = (lobe * bB + lobe * dB + lobe * hB + lobe * fB + eB) * rcpL;
+ 
+-	Dest[DTid.xy] = float4(pixR, pixG, pixB, 1.0);
++	float3 resolved = e + clamp(detailGain, 1.0, 5.0) * (float3(pixR, pixG, pixB) - e);
++	Dest[DTid.xy] = float4(saturate(resolved) * normalization, center.a);
+ }
+diff --git a/runtime/open-shaders/src/Features/Upscaling.cpp b/runtime/open-shaders/src/Features/Upscaling.cpp
+index 77fed79..6eaba2f 100644
+--- a/runtime/open-shaders/src/Features/Upscaling.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling.cpp
+@@ -48,6 +48,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+ 	sharpnessFSR,
+ 	sharpnessEnabledDLSS,
+ 	sharpnessDLSS,
++	sharpnessAfterNR,
+ 	presetDLSS,
+ 	reflexLowLatencyMode,
+ 	reflexLowLatencyBoost,
+@@ -398,8 +399,15 @@ void Upscaling::DrawDLSSNRSharedControls()
+ 		ImGui::Checkbox(T(TKEY("enable_sharpening"), "Enable Sharpening"), &settings.sharpnessEnabledDLSS);
+ 		if (auto _tt = Util::HoverTooltipWrapper())
+ 			ImGui::TextUnformatted(T(TKEY("enable_sharpening_tooltip"), "Applies RCAS sharpening to the DLSS output. Off by default; DLSS already resolves a sharp image."));
+-		if (settings.sharpnessEnabledDLSS)
+-			ImGui::SliderFloat(T(TKEY("sharpness"), "Sharpness"), &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
++		if (settings.sharpnessEnabledDLSS) {
++			ImGui::SliderFloat(T(TKEY("sharpness"), "Sharpness"), &settings.sharpnessDLSS, 0.0f, Sharpening::kMaximumStrength, "%.2f");
++			if (globals::game::isVR && foveatedRender.IsActive() && foveatedRender.settings.neuralRenderingPreUpscale == 0) {
++				if (ImGui::Button(settings.sharpnessAfterNR ? "Sharpening: After NR" : "Sharpening: Before NR"))
++					settings.sharpnessAfterNR = !settings.sharpnessAfterNR;
++				if (auto _tt = Util::HoverTooltipWrapper())
++					ImGui::TextUnformatted("Click to change the order. After sharpens the final scene; Before sharpens the input NR sees. Strength above 1 amplifies detail and can emphasize halos.");
++			}
++		}
+ 
+ 		const char* presets[] = {
+ 			T(TKEY("dlss_model_preset_default"), "Default"),
+@@ -671,6 +679,16 @@ std::string Upscaling::GetProfilePreviewText(PerfProfile profile) const
+ 
+ void Upscaling::RegisterUxActions()
+ {
++	FEATURE_COMMAND("setImageFinishing",
++		"Set image finishing live. Params: enabled (bool), strength (0..5), afterNR (bool), originalColour (0..1), originalBrightness (0..1). Placement applies to post-upscale NR; original-scene matching applies to VR foveated LDR. Brightness preservation reduces generated shading. Omitted values are retained.",
++		[](Feature*, const json& args) {
++			settings.sharpnessEnabledDLSS = args.value("enabled", settings.sharpnessEnabledDLSS);
++			settings.sharpnessDLSS = Sharpening::Sanitize(args.value("strength", settings.sharpnessDLSS));
++			settings.sharpnessAfterNR = args.value("afterNR", settings.sharpnessAfterNR);
++			auto unit = [](float value) { return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f; };
++			foveatedRender.settings.neuralRenderingOriginalColour = unit(args.value("originalColour", foveatedRender.settings.neuralRenderingOriginalColour));
++			foveatedRender.settings.neuralRenderingOriginalBrightness = unit(args.value("originalBrightness", foveatedRender.settings.neuralRenderingOriginalBrightness));
++		});
+ 	FEATURE_QUERY("eyeTrackingStatus",
+ 		"Read native OpenVR query validity/cost, last-valid-query age (not sensor age), raw/filtered gaze, resolved crops and history-reset counters. Params: none.",
+ 		[](const Feature*, const json&) -> json {
+@@ -856,8 +874,15 @@ void Upscaling::DrawSettings()
+ 									  "Off by default; DLSS already resolves a sharp image."));
+ 			}
+ 
+-			if (settings.sharpnessEnabledDLSS)
+-				ImGui::SliderFloat(T(TKEY("sharpness"), "Sharpness"), &settings.sharpnessDLSS, 0.0f, 1.0f, "%.1f");
++			if (settings.sharpnessEnabledDLSS) {
++				ImGui::SliderFloat(T(TKEY("sharpness"), "Sharpness"), &settings.sharpnessDLSS, 0.0f, Sharpening::kMaximumStrength, "%.2f");
++				if (globals::game::isVR && foveatedRender.IsActive() && foveatedRender.settings.neuralRenderingPreUpscale == 0) {
++					if (ImGui::Button(settings.sharpnessAfterNR ? "Sharpening: After NR" : "Sharpening: Before NR"))
++						settings.sharpnessAfterNR = !settings.sharpnessAfterNR;
++					if (auto _tt = Util::HoverTooltipWrapper())
++						ImGui::TextUnformatted("Click to change the order. After sharpens the final scene; Before sharpens the input NR sees. Strength above 1 amplifies detail and can emphasize halos.");
++				}
++			}
+ 
+ 			const char* presets[] = {
+ 				T(TKEY("dlss_model_preset_default"), "Default"),
+@@ -1278,6 +1303,7 @@ void Upscaling::LoadSettings(json& o_json)
+ 	// detect absence explicitly so a pre-existing config still runs the migration.
+ 	const bool hadFsr4SchemaVersion = o_json.contains("fsr4RuntimeSelectionSchemaVersion");
+ 	settings = o_json;
++	settings.sharpnessDLSS = Sharpening::Sanitize(settings.sharpnessDLSS);
+ 	if (!hadFsr4SchemaVersion)
+ 		settings.fsr4RuntimeSelectionSchemaVersion = 0;
+ 	ApplyLegacyFsr4RuntimeSelectionMigration(settings, fidelityFX.GetFsr4AdapterSupport());
+@@ -3305,9 +3331,8 @@ void Upscaling::ApplySharpening()
+ 
+ 		CS_GPU_PASS("Upscaling::Sharpening");
+ 
+-		float currentSharpness = (-2.0f * settings.sharpnessDLSS) + 2.0f;
+-		currentSharpness = exp2(-currentSharpness);
+-		rcas.ApplySharpen(perfMode.GetRefraTempSRV(), perfMode.GetTestTextureUAV(), currentSharpness);
++		if (!rcas.ApplySharpen(perfMode.GetRefraTempSRV(), perfMode.GetTestTextureUAV(), settings.sharpnessDLSS))
++			globals::d3d::context->CopyResource(perfMode.GetTestTexture(), perfMode.GetRefraTempTex());
+ 		return;
+ 	}
+ 
+@@ -3327,14 +3352,9 @@ void Upscaling::ApplySharpening()
+ 	context->OMSetRenderTargets(0, nullptr, nullptr);
+ 
+ 	if (settings.sharpnessEnabledDLSS && settings.sharpnessDLSS > 0.0f && main.UAV) {
+-		// Match FSR3's slider->RCAS conversion exactly (ffx_fsr3upscaler.cpp + FsrRcasCon):
+-		//   sharpenessRemapped = -2*slider + 2   (sharpness in stops)
+-		//   rcasAttenuation    = exp2(-sharpenessRemapped) = exp2(2*slider - 2)
+-		float currentSharpness = (-2.0f * settings.sharpnessDLSS) + 2.0f;
+-		currentSharpness = exp2(-currentSharpness);
+-
+ 		// DLSS has already written to sharpenerTexture; sharpen directly into kMAIN.UAV.
+-		rcas.ApplySharpen(sharpenerTexture->srv.get(), main.UAV, currentSharpness);
++		if (!rcas.ApplySharpen(sharpenerTexture->srv.get(), main.UAV, settings.sharpnessDLSS))
++			context->CopyResource(main.texture, sharpenerTexture->resource.get());
+ 	} else {
+ 		// Sharpening is disabled: resolve the DLSS output without altering it.
+ 		context->CopyResource(main.texture, sharpenerTexture->resource.get());
+@@ -3393,18 +3413,8 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
+ 		upscaling.UpscaleDepth();
+ 	}
+ 
+-	if (upscaleMethod == UpscaleMethod::kDLSS) {
+-		// FoveatedRender's DLSS output doesn't land in sharpenerTexture the
+-		// way dev's path does (the route writes to its own per-eye intermediates
+-		// and copies back to kMAIN/testTexture), so dev's zero-copy
+-		// ApplySharpening can't read sharpenerTexture. Route through
+-		// Postprocess::ApplyDlssSharpening which does the kMAIN → sharpener →
+-		// kMAIN round-trip. Both paths honor sharpnessDLSS=0 to disable RCAS.
+-		if (FoveatedRenderImpl::Bridge::IsRouteActive()) {
+-			FoveatedRenderImpl::Postprocess::ApplyDlssSharpening(upscaling);
+-		} else {
+-			upscaling.ApplySharpening();
+-		}
++	if (upscaleMethod == UpscaleMethod::kDLSS && !FoveatedRenderImpl::Bridge::IsRouteActive()) {
++		upscaling.ApplySharpening();
+ 	}
+ 
+ 	Util::SetTemporal(upscaleMethod == UpscaleMethod::kTAA);
+diff --git a/runtime/open-shaders/src/Features/Upscaling.h b/runtime/open-shaders/src/Features/Upscaling.h
+index 5715c42..d828178 100644
+--- a/runtime/open-shaders/src/Features/Upscaling.h
++++ b/runtime/open-shaders/src/Features/Upscaling.h
+@@ -96,6 +96,7 @@ public:
+ 		float sharpnessFSR = 0.8f;
+ 		bool sharpnessEnabledDLSS = false;
+ 		float sharpnessDLSS = 0.0f;
++		bool sharpnessAfterNR = true;
+ 		uint presetDLSS = 0;  // 0=Default, 1=J, 2=K, 3=L, 4=M
+ 		bool reflexLowLatencyMode = false;
+ 		bool reflexLowLatencyBoost = false;
+@@ -447,7 +448,7 @@ public:
+ 	 */
+ 	bool IsPerfModeSharpenRedirectActive() const
+ 	{
+-		return perfMode.IsHookActive() && perfMode.GetTestTexture() && perfMode.GetTestTextureUAV() &&
++		return !foveatedRender.IsActive() && perfMode.IsHookActive() && perfMode.GetTestTexture() && perfMode.GetTestTextureUAV() &&
+ 		       perfMode.GetRefraTempTex() && perfMode.GetRefraTempSRV() && perfMode.GetRefraTempUAV() &&
+ 		       settings.sharpnessEnabledDLSS && settings.sharpnessDLSS > 0.0f;
+ 	}
+diff --git a/runtime/open-shaders/src/Features/Upscaling/CropMotion.cpp b/runtime/open-shaders/src/Features/Upscaling/CropMotion.cpp
+new file mode 100644
+index 0000000..db5dcb1
+--- /dev/null
++++ b/runtime/open-shaders/src/Features/Upscaling/CropMotion.cpp
+@@ -0,0 +1,154 @@
++#include "CropMotion.h"
++#include "../../Globals.h"
++#include "../../GpuPass.h"
++#include "../../Util.h"
++#include "../../Utils/D3D.h"
++
++#include <wrl/client.h>
++
++namespace FoveatedRenderImpl::CropMotion
++{
++	namespace
++	{
++		using Microsoft::WRL::ComPtr;
++		struct Slot
++		{
++			History previous{}, pending{};
++			ComPtr<ID3D11Resource> source;
++			ComPtr<ID3D11ShaderResourceView> sourceView;
++			ComPtr<ID3D11Texture2D> output;
++			ComPtr<ID3D11UnorderedAccessView> outputView;
++			D3D11_TEXTURE2D_DESC desc{};
++		};
++		std::array<Slot, 4> slots;
++		ComPtr<ID3D11ComputeShader> shader;
++		ComPtr<ID3D11Buffer> constants;
++		struct Constants
++		{
++			std::uint32_t width, height;
++			float dx, dy;
++		};
++		static_assert(sizeof(Constants) == 16);
++
++		bool EnsureResources(Slot& slot, ID3D11Resource* source)
++		{
++			auto* device = globals::d3d::device;
++			if (!device)
++				return false;
++			if (!shader) {
++				shader.Attach(static_cast<ID3D11ComputeShader*>(Util::CompileShader(
++					L"Data\\Shaders\\Upscaling\\FoveatedRender\\CropMotionCS.hlsl", {}, "cs_5_0")));
++				if (!shader)
++					return false;
++				Util::SetResourceName(shader.Get(), "FoveatedRender::CropMotion");
++			}
++			if (!constants) {
++				D3D11_BUFFER_DESC desc{};
++				desc.ByteWidth = sizeof(Constants);
++				desc.Usage = D3D11_USAGE_DEFAULT;
++				desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++				if (FAILED(device->CreateBuffer(&desc, nullptr, &constants)))
++					return false;
++				Util::SetResourceName(constants.Get(), "FoveatedRender::CropMotionConstants");
++			}
++			if (slot.source.Get() == source && slot.sourceView && slot.output && slot.outputView)
++				return true;
++			ComPtr<ID3D11Texture2D> texture;
++			if (FAILED(source->QueryInterface(IID_PPV_ARGS(&texture))))
++				return false;
++			D3D11_TEXTURE2D_DESC desc{};
++			texture->GetDesc(&desc);
++			if (desc.ArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 ||
++				(desc.Format != DXGI_FORMAT_R16G16_FLOAT && desc.Format != DXGI_FORMAT_R32G32_FLOAT))
++				return false;
++			slot.sourceView.Reset();
++			if (FAILED(device->CreateShaderResourceView(source, nullptr, &slot.sourceView)))
++				return false;
++			Util::SetResourceName(slot.sourceView.Get(), "FoveatedRender::CropMotionSource SRV");
++			if (!slot.output || slot.desc.Width != desc.Width || slot.desc.Height != desc.Height || slot.desc.Format != desc.Format) {
++				slot.output.Reset();
++				slot.outputView.Reset();
++				desc.Usage = D3D11_USAGE_DEFAULT;
++				desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
++				desc.CPUAccessFlags = 0;
++				desc.MiscFlags = 0;
++				if (FAILED(device->CreateTexture2D(&desc, nullptr, &slot.output)) ||
++					FAILED(device->CreateUnorderedAccessView(slot.output.Get(), nullptr, &slot.outputView)))
++					return false;
++				Util::SetResourceName(slot.output.Get(), "FoveatedRender::CropMotionOutput");
++				Util::SetResourceName(slot.outputView.Get(), "FoveatedRender::CropMotionOutput UAV");
++			}
++			slot.source = source;
++			slot.desc = desc;
++			return true;
++		}
++	}
++
++	ID3D11Resource* Prepare(std::uint32_t index, ID3D11Resource* source,
++		const Region& region, std::uint32_t guideWidth, std::uint32_t guideHeight,
++		std::array<float, 2> scale, std::uint32_t frame, bool& reset)
++	{
++		if (index >= slots.size() || !source || !globals::d3d::context || !guideWidth || !guideHeight)
++			return nullptr;
++		auto& slot = slots[index];
++		slot.pending = {};
++		const auto offset = Offset(slot.previous, region, scale, frame, reset);
++		slot.pending = { region, scale, frame, true };
++		if (offset[0] == 0.0f && offset[1] == 0.0f)
++			return source;
++		if (!EnsureResources(slot, source) || guideWidth > slot.desc.Width || guideHeight > slot.desc.Height) {
++			slot.pending.valid = false;
++			return nullptr;
++		}
++		CS_GPU_PASS("FoveatedRender::CropMotion");
++		auto* context = globals::d3d::context;
++		ComPtr<ID3D11ComputeShader> oldShader;
++		ComPtr<ID3D11ShaderResourceView> oldSource;
++		ComPtr<ID3D11UnorderedAccessView> oldOutput;
++		ComPtr<ID3D11Buffer> oldConstants;
++		std::array<ID3D11ClassInstance*, 256> classes{};
++		UINT classCount = static_cast<UINT>(classes.size());
++		context->CSGetShader(&oldShader, classes.data(), &classCount);
++		context->CSGetShaderResources(0, 1, &oldSource);
++		context->CSGetUnorderedAccessViews(0, 1, &oldOutput);
++		context->CSGetConstantBuffers(0, 1, &oldConstants);
++		ID3D11UnorderedAccessView* nullOutput = nullptr;
++		context->CSSetUnorderedAccessViews(0, 1, &nullOutput, nullptr);
++		const Constants data{ guideWidth, guideHeight, offset[0], offset[1] };
++		context->UpdateSubresource(constants.Get(), 0, nullptr, &data, 0, 0);
++		context->CSSetShader(shader.Get(), nullptr, 0);
++		context->CSSetShaderResources(0, 1, slot.sourceView.GetAddressOf());
++		context->CSSetUnorderedAccessViews(0, 1, slot.outputView.GetAddressOf(), nullptr);
++		context->CSSetConstantBuffers(0, 1, constants.GetAddressOf());
++		context->Dispatch((guideWidth + 7) / 8, (guideHeight + 7) / 8, 1);
++		context->CSSetUnorderedAccessViews(0, 1, &nullOutput, nullptr);
++		context->CSSetShaderResources(0, 1, oldSource.GetAddressOf());
++		context->CSSetUnorderedAccessViews(0, 1, oldOutput.GetAddressOf(), nullptr);
++		context->CSSetConstantBuffers(0, 1, oldConstants.GetAddressOf());
++		context->CSSetShader(oldShader.Get(), classes.data(), classCount);
++		for (UINT i = 0; i < classCount; ++i)
++			classes[i]->Release();
++		return slot.output.Get();
++	}
++
++	void Commit(std::uint32_t slot, bool succeeded)
++	{
++		if (slot < slots.size())
++			slots[slot].previous = succeeded ? slots[slot].pending : History{};
++	}
++
++	void Invalidate(std::uint32_t firstSlot, std::uint32_t count)
++	{
++		for (auto i = firstSlot; i < slots.size() && i - firstSlot < count; ++i) {
++			slots[i].previous = {};
++			slots[i].pending = {};
++		}
++	}
++
++	void Clear()
++	{
++		slots = {};
++		shader.Reset();
++		constants.Reset();
++	}
++}
+diff --git a/runtime/open-shaders/src/Features/Upscaling/CropMotion.h b/runtime/open-shaders/src/Features/Upscaling/CropMotion.h
+new file mode 100644
+index 0000000..ecede95
+--- /dev/null
++++ b/runtime/open-shaders/src/Features/Upscaling/CropMotion.h
+@@ -0,0 +1,19 @@
++#pragma once
++
++#include "CropMotionHistory.h"
++
++struct ID3D11Resource;
++
++namespace FoveatedRenderImpl::CropMotion
++{
++	/** Prepare private compensated vectors; slots 0/1 are SR, 2/3 are NR. */
++	ID3D11Resource* Prepare(std::uint32_t slot, ID3D11Resource* source,
++		const Region& region, std::uint32_t guideWidth, std::uint32_t guideHeight,
++		std::array<float, 2> scale, std::uint32_t frame, bool& reset);
++	/** Advance history only after the corresponding reconstruction succeeds. */
++	void Commit(std::uint32_t slot, bool succeeded);
++	/** Invalidate a stage without reallocating GPU resources. */
++	void Invalidate(std::uint32_t firstSlot = 0, std::uint32_t count = 4);
++	/** Release resources on device/shader teardown. */
++	void Clear();
++}
+diff --git a/runtime/open-shaders/src/Features/Upscaling/CropMotionHistory.h b/runtime/open-shaders/src/Features/Upscaling/CropMotionHistory.h
+new file mode 100644
+index 0000000..903800b
+--- /dev/null
++++ b/runtime/open-shaders/src/Features/Upscaling/CropMotionHistory.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++namespace FoveatedRenderImpl::CropMotion
++{
++	struct Region
++	{
++		std::uint32_t x = 0, y = 0, width = 0, height = 0;
++	};
++
++	struct History
++	{
++		Region region{};
++		std::array<float, 2> scale{};
++		std::uint32_t frame = 0;
++		bool valid = false;
++	};
++
++	/** Convert current-to-previous crop displacement to stored motion-vector units. */
++	inline std::array<float, 2> Offset(const History& previous, const Region& current,
++		std::array<float, 2> scale, std::uint32_t frame, bool& reset)
++	{
++		const double dx = double(current.x) - previous.region.x;
++		const double dy = double(current.y) - previous.region.y;
++		constexpr double maxShiftFraction = 0.25;
++		reset = reset || !previous.valid || std::uint32_t(frame - previous.frame) != 1 ||
++			current.width != previous.region.width || current.height != previous.region.height ||
++			!current.width || !current.height || scale != previous.scale ||
++			!std::isfinite(scale[0]) || !std::isfinite(scale[1]) || !scale[0] || !scale[1] ||
++			std::abs(dx) > current.width * maxShiftFraction || std::abs(dy) > current.height * maxShiftFraction;
++		if (reset)
++			return {};
++		return { float(dx / (double(current.width) * scale[0])),
++			float(dy / (double(current.height) * scale[1])) };
++	}
++}
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
+index 7977eaa..75d9358 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
+@@ -9,6 +9,8 @@
+ #include "../Upscaling.h"
+ #include "../VR.h"
+ #include "FoveatedRender/Core.h"
++#include "FoveatedRender/Bridge.h"
++#include "FoveatedRender/Postprocess.h"
+ #include "NativeOpenVRGaze.h"
+ #include "NeuralRendering/Integration.h"
+ #include "NeuralRendering/FuturePipeline.h"
+@@ -89,6 +91,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+ 	neuralRenderingModelResolution,
+ 	neuralRenderingPreset,
+ 	neuralRenderingIntensity,
++	neuralRenderingOriginalColour,
++	neuralRenderingOriginalBrightness,
+ 	neuralRenderingLocalTone,
+ 	neuralRenderingLocalStructure,
+ 	neuralRenderingSkinStructure,
+@@ -173,12 +177,20 @@ void FoveatedRender::PostPostLoad()
+ 
+ void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
+ {
++	auto& upscaling = globals::features::upscaling;
++	const bool sharpen = FoveatedRenderImpl::Bridge::IsRouteActive() &&
++		upscaling.GetUpscaleMethod() == Upscaling::UpscaleMethod::kDLSS;
++	if (sharpen && !upscaling.settings.sharpnessAfterNR)
++		FoveatedRenderImpl::Postprocess::ApplyDlssSharpening(upscaling);
+ 	NeuralRendering::ApplyFoveatedLdr();
++	if (sharpen && upscaling.settings.sharpnessAfterNR)
++		FoveatedRenderImpl::Postprocess::ApplyDlssSharpening(upscaling);
+ 	func(imageSpaceShader, shape, param);
+ }
+ 
+ void FoveatedRender::ClearShaderCache()
+ {
++	FoveatedRenderImpl::Postprocess::Reset();
+ 	FoveatedRenderImpl::Core::ClearShaderCache();
+ 	NeuralRendering::Renderer::Instance().ClearShaderCache();
+ 	FoveatedRenderImpl::Core::ClearResources();
+@@ -298,6 +310,8 @@ void FoveatedRender::ClampSettings()
+ 			(settings.neuralRenderingModelResolution < 70 ? 70 : 100);
+ 	settings.neuralRenderingPreset = std::min(settings.neuralRenderingPreset, 5u);
+ 	settings.neuralRenderingIntensity = std::clamp(settings.neuralRenderingIntensity, 0.0f, 2.0f);
++	settings.neuralRenderingOriginalColour = std::isfinite(settings.neuralRenderingOriginalColour) ? std::clamp(settings.neuralRenderingOriginalColour, 0.0f, 1.0f) : 0.0f;
++	settings.neuralRenderingOriginalBrightness = std::isfinite(settings.neuralRenderingOriginalBrightness) ? std::clamp(settings.neuralRenderingOriginalBrightness, 0.0f, 1.0f) : 0.0f;
+ 	settings.neuralRenderingLocalTone = std::clamp(settings.neuralRenderingLocalTone, 0.0f, 2.0f);
+ 	settings.neuralRenderingLocalStructure = std::clamp(settings.neuralRenderingLocalStructure, 0.0f, 2.0f);
+ 	settings.neuralRenderingSkinStructure = std::clamp(settings.neuralRenderingSkinStructure, -1.0f, 2.0f);
+@@ -716,7 +730,7 @@ uint FoveatedRender::GetActivePresetDLSS() const
+ 
+ float FoveatedRender::GetActiveSharpnessDLSS() const
+ {
+-	return std::clamp(globals::features::upscaling.settings.sharpnessDLSS, 0.0f, 1.0f);
++	return Sharpening::Sanitize(globals::features::upscaling.settings.sharpnessDLSS);
+ }
+ 
+ float FoveatedRender::GetRenderScaleForQuality(uint qualityMode)
+@@ -1368,6 +1382,14 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+ 			}
+ 			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
+ 			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
++			if (globals::game::isVR && settings.neuralRenderingPreUpscale == 0) {
++				ImGui::SliderFloat("Preserve Skyrim colours", &settings.neuralRenderingOriginalColour, 0.0f, 1.0f, "%.2f");
++				if (auto _tt = Util::HoverTooltipWrapper())
++					ImGui::TextUnformatted("Blends colour toward the current scene before NR while retaining NR luma. 0: NR colours; 1: original chroma. Gamut limits can also affect brightness.");
++				ImGui::SliderFloat("Preserve Skyrim brightness", &settings.neuralRenderingOriginalBrightness, 0.0f, 1.0f, "%.2f");
++				if (auto _tt = Util::HoverTooltipWrapper())
++					ImGui::TextUnformatted("Blends luma toward the scene before NR. Higher values reduce generated lighting and shading detail. With both preservation controls at 1 the original RGB is restored.");
++			}
+ 			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_structure"), "Local Structure"), &settings.neuralRenderingLocalStructure, 0.0f, 2.0f, "%.2f");
+ 			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure"), &settings.neuralRenderingSkinStructure, -1.0f, 2.0f, "%.2f");
+ 			custom |= ImGui::Checkbox(T(TKEY("neural_rendering_auto_mask"), "Automatic Mask"), &settings.neuralRenderingAutoMask);
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h
+index 89c793a..5b8ddaf 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h
+@@ -112,6 +112,8 @@ struct FoveatedRender
+ 		uint neuralRenderingModelResolution = 100;
+ 		uint neuralRenderingPreset = 0;  // 0 = Default; 5 = Custom
+ 		float neuralRenderingIntensity = 1.70f;
++		float neuralRenderingOriginalColour = 0.0f;
++		float neuralRenderingOriginalBrightness = 0.0f;
+ 		float neuralRenderingLocalTone = 1.00f;
+ 		float neuralRenderingLocalStructure = 1.70f;
+ 		float neuralRenderingSkinStructure = -1.0f;
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Core.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Core.cpp
+index e51217b..7c677b9 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Core.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Core.cpp
+@@ -1,5 +1,6 @@
+ #include "Core.h"
+ #include "Ops.h"
++#include "../CropMotion.h"
+ 
+ #include "../../../State.h"
+ #include "../../../Util.h"
+@@ -1128,8 +1129,11 @@ namespace FoveatedRenderImpl::Ops
+ 		float MaskRadiusX;
+ 		float MaskRadiusY;
+ 		float _pad0;
++		float OriginalColour;
++		float OriginalBrightness;
++		float padding[2];
+ 	};
+-	static_assert(sizeof(BlendCB) == 64);
++	static_assert(sizeof(BlendCB) == 80);
+ 
+ 	uint64_t ComputeSubrectUVHash(const Util::Subrect::UVRegion& leftUV,
+ 		const Util::Subrect::UVRegion& rightUV, uint32_t mode, bool includeOrigins)
+@@ -1188,7 +1192,8 @@ namespace FoveatedRenderImpl::Ops
+ 	}
+ 
+ 	bool BlendSubrectToOutput(ID3D11Resource* dlssSrc, ID3D11Resource* dst, ID3D11UnorderedAccessView* dstUAV,
+-		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX)
++		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX,
++		float originalColour, float originalBrightness, bool blendEdges)
+ 	{
+ 		auto context = globals::d3d::context;
+ 		auto& foveated = globals::features::upscaling.foveatedRender;
+@@ -1196,9 +1201,12 @@ namespace FoveatedRenderImpl::Ops
+ 		const bool adaptiveMask = foveated.IsAdaptiveCropRuntimeActive();
+ 		if (adaptiveMask)
+ 			blendMode = FoveatedRender::SubrectBlendMode::kFeather;
++		if (!blendEdges)
++			blendMode = FoveatedRender::SubrectBlendMode::kHardCopy;
++		const bool matchOriginal = originalColour > 0.0f || originalBrightness > 0.0f;
+ 
+ 		// Fast path: hard copy (original behaviour)
+-		if (blendMode == FoveatedRender::SubrectBlendMode::kHardCopy) {
++		if (blendMode == FoveatedRender::SubrectBlendMode::kHardCopy && !matchOriginal) {
+ 			D3D11_BOX srcBox = { srcOffsetX, 0, 0, srcOffsetX + subWidth, subHeight, 1 };
+ 			context->CopySubresourceRegion(dst, 0, dstOffsetX, dstOffsetY, 0, dlssSrc, 0, &srcBox);
+ 			return true;
+@@ -1278,7 +1286,11 @@ namespace FoveatedRenderImpl::Ops
+ 			cb->DstOffsetY = dstOffsetY;
+ 			cb->SubWidth = subWidth;
+ 			cb->SubHeight = subHeight;
+-			cb->BlendMode = (blendMode == FoveatedRender::SubrectBlendMode::kDither) ? 1 : 0;
++			cb->BlendMode = blendMode == FoveatedRender::SubrectBlendMode::kHardCopy ? 2u :
++				(blendMode == FoveatedRender::SubrectBlendMode::kDither ? 1u : 0u);
++			cb->OriginalColour = std::clamp(originalColour, 0.0f, 1.0f);
++			cb->OriginalBrightness = std::clamp(originalBrightness, 0.0f, 1.0f);
++			cb->padding[0] = cb->padding[1] = 0.0f;
+ 			cb->MaskMode = (foveated.GetSubrectMaskMode() == FoveatedRender::SubrectMaskMode::kOval) ? 1 : 0;
+ 			cb->FrameIndex = globals::state->frameCount;
+ 			cb->SrcOffsetX = srcOffsetX;
+@@ -1721,11 +1733,13 @@ namespace FoveatedRenderImpl
+ 
+ 		activeSubrectUVHash = 0;
+ 		neuralGuidesFrame = UINT32_MAX;
++		CropMotion::Clear();
+ 		ResetAdaptiveCropHandoff();
+ 	}
+ 
+ 	void Core::InvalidateTemporalState()
+ 	{
++		CropMotion::Invalidate();
+ 		// A crop can move without changing the intermediate dimensions. In that
+ 		// case resource recreation alone is insufficient: the old guide snapshot,
+ 		// periphery history, and DLSSNR history all describe the previous region.
+@@ -1743,6 +1757,7 @@ namespace FoveatedRenderImpl
+ 
+ 	void Core::ClearShaderCache()
+ 	{
++		CropMotion::Clear();
+ 		vrSubrectStretchCS = nullptr;
+ 		vrSubrectStretchCB = nullptr;
+ 		vrSubrectStretchSampler = nullptr;
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Modes.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Modes.cpp
+index d1a1c1f..025f33d 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Modes.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Modes.cpp
+@@ -11,6 +11,7 @@
+ #include "Core.h"
+ #include "Ops.h"
+ #include "Params.h"
++#include "../CropMotion.h"
+ 
+ #include "../../../Globals.h"
+ #include "../../../Utils/Subrect.h"
+@@ -90,6 +91,8 @@ namespace FoveatedRenderImpl
+ 		bool result = (p.mode == FoveatedRender::DlssMode::kFaster) ?
+ 		                  ExecuteFasterMode(streamline, p) :
+ 		                  ExecuteDefaultMode(streamline, p);
++		for (uint32_t eye = 0; eye < 2; ++eye)
++			CropMotion::Commit(eye, result && Core::neuralGuidesFrame == frame && p.eyeTrackedGazeConfigured && !p.isFullEye);
+ 		Bridge::foveatedEvaluating = false;
+ 		Bridge::gazeHistoryReset = false;
+ 		return result;
+@@ -222,9 +225,23 @@ namespace FoveatedRenderImpl
+ 			if (p.transparencyMask)
+ 				context->CopySubresourceRegion(Core::vrSubrectTransparencyMask[i]->resource.get(), 0, 0, 0, 0, p.transparencyMask, 0, &sbsCrop);
+ 
++			ID3D11Resource* srMotion = Core::vrSubrectMotionVectors[i]->resource.get();
++			if (p.eyeTrackedGazeConfigured) {
++				float scaleX = 1.0f, scaleY = 1.0f;
++				Bridge::ComputeMvecScale(i, scaleX, scaleY);
++				bool reset = p.eyeTrackedGazeReset;
++				srMotion = CropMotion::Prepare(i, srMotion, { cropX, cropY, subInW, subInH },
++					subInW, subInH, { scaleX, scaleY }, frame, reset);
++				if (!srMotion) {
++					Core::InvalidateTemporalState();
++					return true;
++				}
++				Bridge::gazeHistoryReset = reset;
++			}
++
+ 			if (!DispatchUpscaleRegion(streamline, i,
+ 					Core::vrSubrectColorIn[i]->resource.get(), Core::vrSubrectColorOut[i]->resource.get(),
+-					Core::vrSubrectDepth[i]->resource.get(), Core::vrSubrectMotionVectors[i]->resource.get(),
++					Core::vrSubrectDepth[i]->resource.get(), srMotion,
+ 					p.reactiveMask ? Core::vrSubrectReactiveMask[i]->resource.get() : nullptr,
+ 					p.transparencyMask ? Core::vrSubrectTransparencyMask[i]->resource.get() : nullptr,
+ 					subInW, subInH, subOutW, subOutH,
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Ops.h b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Ops.h
+index 03ca298..70d425f 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Ops.h
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Ops.h
+@@ -87,7 +87,8 @@ namespace FoveatedRenderImpl::Ops
+ 	// kHardCopy fast-paths to CopySubresourceRegion; Feather/Dither dispatch
+ 	// SubrectBlendCS into dstUAV.
+ 	bool BlendSubrectToOutput(ID3D11Resource* dlssSrc, ID3D11Resource* dst, ID3D11UnorderedAccessView* dstUAV,
+-		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX = 0);
++		uint32_t dstOffsetX, uint32_t dstOffsetY, uint32_t subWidth, uint32_t subHeight, uint32_t srcOffsetX = 0,
++		float originalColour = 0.0f, float originalBrightness = 0.0f, bool blendEdges = true);
+ 
+ 	// Hash of per-eye UVs + mode for change detection (forces SL DLSS resource
+ 	// recreation). Both eyes are mixed in so asymmetric presets — e.g. Nasal
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.cpp
+index 535eea8..a6887ac 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.cpp
+@@ -1,62 +1,89 @@
+ #include "Postprocess.h"
+ 
+ #include "../../../Globals.h"
++#include "../../../GpuPass.h"
+ #include "../../../State.h"
+ #include "../../Upscaling.h"
+-#include "../FoveatedRender.h"
+-
+-#include <cmath>
+ 
+ namespace FoveatedRenderImpl
+ {
++	namespace
++	{
++		eastl::unique_ptr<Texture2D> sharpenTarget;
++		D3D11_TEXTURE2D_DESC sharpenDesc{};
++		uint32_t sharpenFrame = UINT32_MAX;
++	}
++
++	void Postprocess::Reset()
++	{
++		sharpenTarget.reset();
++		sharpenDesc = {};
++		sharpenFrame = UINT32_MAX;
++	}
++
+ 	bool Postprocess::ApplyDlssSharpening(Upscaling& upscaling)
+ 	{
+-		// sharpnessDLSS <= 0 is the single disable signal — sharpness lives on
+-		// Upscaling::Settings so the route shares the global slider.
+-		const float sharpnessSetting = upscaling.settings.sharpnessDLSS;
+-		if (sharpnessSetting <= 0.0f) {
++		const float strength = Sharpening::Sanitize(upscaling.settings.sharpnessDLSS);
++		if (!upscaling.settings.sharpnessEnabledDLSS || strength == 0.0f)
+ 			return true;
+-		}
+-
+-		if (!upscaling.sharpenerTexture || !upscaling.sharpenerTexture->uav || !upscaling.sharpenerTexture->resource) {
+-			logger::error("[FOVEATED] Missing sharpener resources");
++		auto* context = globals::d3d::context;
++		auto* renderer = globals::game::renderer;
++		if (!context || !renderer || !globals::state)
+ 			return false;
+-		}
+-
+-		auto context = globals::d3d::context;
+-		auto renderer = globals::game::renderer;
+-		if (!context || !renderer) {
+-			logger::error("[FOVEATED] Missing D3D context or renderer for sharpening");
++		const auto frame = globals::state->frameCount;
++		if (sharpenFrame == frame)
++			return true;
++		auto& total = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kTOTAL];
++		if (!total.texture || !total.SRV)
+ 			return false;
+-		}
+-		auto& main = renderer->GetRuntimeData().renderTargets[RE::RENDER_TARGETS::kMAIN];
+-
+-		if (!main.SRV) {
+-			logger::error("[FOVEATED] Missing main SRV for sharpening");
++		D3D11_TEXTURE2D_DESC desc{};
++		total.texture->GetDesc(&desc);
++		if (desc.SampleDesc.Count != 1 || desc.ArraySize != 1 || desc.MipLevels != 1 ||
++			!desc.Width || (desc.Width % 2) != 0 || !desc.Height)
+ 			return false;
++		if (!sharpenTarget || desc.Width != sharpenDesc.Width || desc.Height != sharpenDesc.Height || desc.Format != sharpenDesc.Format) {
++			sharpenTarget = Upscaling::CreateTextureFromSource(total.texture, desc.Width, desc.Height,
++				false, false, true, "FoveatedRender::FinalSharpen");
++			sharpenDesc = desc;
+ 		}
+-
+-		// Same exponential mapping Upscaling::ApplySharpening uses: lower
+-		// setting = stronger sharpen.
+-		float currentSharpness = (-2.0f * sharpnessSetting) + 2.0f;
+-		currentSharpness = exp2(-currentSharpness);
+-
+-		// In-place RCAS on kMAIN through sharpenerTexture.
+-		ID3D11Resource* mainResource = nullptr;
+-		main.SRV->GetResource(&mainResource);
+-		if (!mainResource) {
+-			logger::error("[FOVEATED] Failed to acquire main resource for sharpening");
++		if (!sharpenTarget || !sharpenTarget->resource || !sharpenTarget->uav)
+ 			return false;
+-		}
+ 
++		CS_GPU_PASS("FoveatedRender::SharpenFinalScene");
++		ID3D11RenderTargetView* oldRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
++		ID3D11DepthStencilView* oldDSV = nullptr;
++		winrt::com_ptr<ID3D11ComputeShader> oldShader;
++		winrt::com_ptr<ID3D11ShaderResourceView> oldSource;
++		winrt::com_ptr<ID3D11UnorderedAccessView> oldOutput;
++		winrt::com_ptr<ID3D11Buffer> oldConstants;
++		ID3D11ClassInstance* classes[256]{};
++		UINT classCount = 256;
++		context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldRTVs, &oldDSV);
++		context->CSGetShader(oldShader.put(), classes, &classCount);
++		context->CSGetShaderResources(0, 1, oldSource.put());
++		context->CSGetUnorderedAccessViews(0, 1, oldOutput.put());
++		context->CSGetConstantBuffers(0, 1, oldConstants.put());
+ 		context->OMSetRenderTargets(0, nullptr, nullptr);
+-		upscaling.rcas.ApplySharpen(main.SRV, upscaling.sharpenerTexture->uav.get(), currentSharpness);
+-		context->CopyResource(mainResource, upscaling.sharpenerTexture->resource.get());
+-		mainResource->Release();
+-
+-		if (globals::game::stateUpdateFlags) {
+-			globals::game::stateUpdateFlags->set(RE::BSGraphics::ShaderFlags::DIRTY_RENDERTARGET);
++		ID3D11UnorderedAccessView* nullOutput = nullptr;
++		context->CSSetUnorderedAccessViews(0, 1, &nullOutput, nullptr);
++		const bool applied = upscaling.rcas.ApplySharpen(total.SRV, sharpenTarget->uav.get(), strength);
++		if (applied) {
++			context->CopyResource(total.texture, sharpenTarget->resource.get());
++			sharpenFrame = frame;
+ 		}
+-		return true;
++		auto* oldSourceView = oldSource.get();
++		auto* oldOutputView = oldOutput.get();
++		auto* oldBuffer = oldConstants.get();
++		context->CSSetShaderResources(0, 1, &oldSourceView);
++		context->CSSetUnorderedAccessViews(0, 1, &oldOutputView, nullptr);
++		context->CSSetConstantBuffers(0, 1, &oldBuffer);
++		context->CSSetShader(oldShader.get(), classes, classCount);
++		for (UINT i = 0; i < classCount; ++i)
++			if (classes[i]) classes[i]->Release();
++		context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldRTVs, oldDSV);
++		for (auto* rtv : oldRTVs)
++			if (rtv) rtv->Release();
++		if (oldDSV) oldDSV->Release();
++		return applied;
+ 	}
+ }
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.h b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.h
+index 7ccc8dc..d9d3b52 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.h
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.h
+@@ -7,10 +7,9 @@ namespace FoveatedRenderImpl
+ 	class Postprocess
+ 	{
+ 	public:
+-		// Sharpening pass for the FoveatedRender route. Mirrors what
+-		// Upscaling::ApplySharpening does but is invoked from
+-		// Main_PostProcessing only when the FoveatedRender route is active.
+-		// Only the kRCAS path is wired.
++		/** Sharpens the current LDR stereo scene once per frame, before UI composition. */
+ 		static bool ApplyDlssSharpening(Upscaling& upscaling);
++		/** Releases the sharpening target and clears the frame guard. */
++		static void Reset();
+ 	};
+ }
+diff --git a/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp b/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp
+index eddbd2c..038967f 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp
+@@ -497,9 +497,7 @@ namespace FoveatedRenderImpl::NativeOpenVRGaze
+ 			a_eyeWidth, a_eyeHeight, a_frame, a_allowDynamic);
+ 		const bool cropChanged = state.cacheValid && (a_config.enabled || state.cachedResult.diagnostics.experimentEnabled) &&
+ 			(!SameRegion(result.leftUV, state.cachedResult.leftUV) || !SameRegion(result.rightUV, state.cachedResult.rightUV));
+-		// Crop-local histories have no verified exposed-region validity mask.
+-		// Any origin change must reset both reconstruction stages without freeing resources.
+-		result.historyReset = result.historyReset || cropChanged;
++		// Each reconstruction stage compensates ordinary origin changes against its last successful frame.
+ 		state.cropChangeCount += cropChanged ? 1 : 0;
+ 		state.historyResetCount += result.historyReset ? 1 : 0;
+ 		result.diagnostics.cropChanged = cropChanged;
+diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
+index 84c9982..1d8fbba 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
+@@ -627,7 +627,9 @@ namespace NeuralRendering
+ 		ID3D11Resource* destination = total.texture;
+ 		ID3D11UnorderedAccessView* destinationUAV = total.UAV;
+ 		bool stagedBlendTarget = false;
+-		if (wantsEdgeBlend && !destinationUAV) {
++		const bool matchOriginal = foveated.settings.neuralRenderingOriginalColour > 0.0f ||
++			foveated.settings.neuralRenderingOriginalBrightness > 0.0f;
++		if ((wantsEdgeBlend || matchOriginal) && !destinationUAV) {
+ 			// kTOTAL is not guaranteed to have D3D11_BIND_UNORDERED_ACCESS. Keep
+ 			// its original background in a private UAV-capable copy, blend there,
+ 			// then copy the finished SBS image back. This costs two full-frame
+@@ -666,6 +668,7 @@ namespace NeuralRendering
+ 				.sourceY = y,
+ 				.motionVectorScaleX = motionScaleX * guideWidth,
+ 				.motionVectorScaleY = motionScaleY * guideHeight,
++				.compensateCropMotion = gazeConfig.enabled && !fullEye,
+ 			};
+ 		}
+ 		Tuning tuning = GetTuning(foveated, true);
+diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
+index 5bb7255..f719a15 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
+@@ -1,3 +1,4 @@
++#include "../CropMotion.h"
+ #include "Renderer.h"
+ 
+ #include "D3D12Interop.h"
+@@ -770,6 +771,9 @@ namespace NeuralRendering
+ 			if (failureLatched || !device || !context || !color)
+ 				return false;
+ 			ID3D11Resource* writeback = destination ? destination : color;
++			const auto& finishing = globals::features::upscaling.foveatedRender.settings;
++			const bool matchOriginal = finishing.neuralRenderingOriginalColour > 0.0f ||
++				finishing.neuralRenderingOriginalBrightness > 0.0f;
+ 			if (!writeback)
+ 				return false;
+ 			CS_GPU_PASS("NeuralRendering::EvaluateStereo");
+@@ -821,7 +825,19 @@ namespace NeuralRendering
+ 					return LatchFailure("model input downsample stereo", E_FAIL);
+ 				if (!CopyDepthGuide(context, input.depthSRV, eye.depth.uav11.Get(), guideWidth, guideHeight))
+ 					return LatchFailure("depth guide conversion", E_FAIL);
+-				context->CopyResource(eye.motionVectors.resource11.Get(), input.motionVectors);
++				ID3D11Resource* nrMotion = input.motionVectors;
++				if (input.compensateCropMotion) {
++					bool reset = resetPending[eyeIndex][tierIndex];
++					nrMotion = FoveatedRenderImpl::CropMotion::Prepare(2 + eyeIndex, nrMotion,
++						{ input.sourceX, input.sourceY, colorWidth, colorHeight }, guideWidth, guideHeight,
++						{ input.motionVectorScaleX * float(modelWidth) / colorWidth / guideWidth,
++						  input.motionVectorScaleY * float(modelHeight) / colorHeight / guideHeight },
++						globals::state->frameCount, reset);
++					if (!nrMotion)
++						return LatchFailure("crop motion preparation", E_FAIL);
++					resetPending[eyeIndex][tierIndex] = reset;
++				}
++				context->CopyResource(eye.motionVectors.resource11.Get(), nrMotion);
+ 			}
+ 
+ 			const auto adaptivePrewarm = PrepareAdjacentPrewarmResources(device, tierIndex,
+@@ -879,9 +895,10 @@ namespace NeuralRendering
+ 						auto& tier = eye.tiers[tierIndex];
+ 						ID3D11Resource* temporalOutput = tier.reducedResolution ?
+ 							tier.resolved.Get() : tier.output.resource11.Get();
+-						if (blendSubrect && destinationUAV) {
++						if ((blendSubrect || matchOriginal) && destinationUAV) {
+ 							FoveatedRenderImpl::Ops::BlendSubrectToOutput(temporalOutput,
+-								writeback, destinationUAV, input.sourceX, input.sourceY, colorWidth, colorHeight);
++								writeback, destinationUAV, input.sourceX, input.sourceY, colorWidth, colorHeight, 0,
++								finishing.neuralRenderingOriginalColour, finishing.neuralRenderingOriginalBrightness, blendSubrect);
+ 						} else {
+ 							context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
+ 								temporalOutput, 0, &outputBox);
+@@ -1142,11 +1159,12 @@ namespace NeuralRendering
+ 						colorWidth, colorHeight, guideWidth, guideHeight,
+ 						input.motionVectorScaleX, input.motionVectorScaleY,
+ 						input.sourceX, input.sourceY, tuning);
+-				if (blendSubrect && destinationUAV) {
++				if ((blendSubrect || matchOriginal) && destinationUAV) {
+ 					// Keep the original background in `writeback` and composite the NR
+ 					// crop over it with the same edge treatment as standard foveated DLSS.
+ 					FoveatedRenderImpl::Ops::BlendSubrectToOutput(writebackOutput, writeback, destinationUAV,
+-						input.sourceX, input.sourceY, colorWidth, colorHeight);
++						input.sourceX, input.sourceY, colorWidth, colorHeight, 0,
++						finishing.neuralRenderingOriginalColour, finishing.neuralRenderingOriginalBrightness, blendSubrect);
+ 				} else {
+ 					context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
+ 						writebackOutput, 0, &outputBox);
+@@ -2512,14 +2530,17 @@ namespace NeuralRendering
+ 		ID3D11Resource* destination, ID3D11UnorderedAccessView* destinationUAV,
+ 		bool blendSubrect, const StereoResourceEnvelope& resourceEnvelope)
+ 	{
+-		return state_->ApplyStereo(device, context, color, eyes,
++		const bool succeeded = state_->ApplyStereo(device, context, color, eyes,
+ 			guideWidth, guideHeight, colorWidth, colorHeight, tuning,
+ 				destination, destinationUAV, blendSubrect, resourceEnvelope);
++		for (std::uint32_t eye = 0; eye < 2; ++eye)
++			FoveatedRenderImpl::CropMotion::Commit(2 + eye, succeeded && eyes[eye].compensateCropMotion);
++		return succeeded;
+ 	}
+ 
+-	bool Renderer::Reset() { return state_->Reset(); }
++	bool Renderer::Reset() { FoveatedRenderImpl::CropMotion::Invalidate(2, 2); return state_->Reset(); }
+ 	void Renderer::ClearShaderCache() { state_->ClearShaderCache(); }
+-	void Renderer::ResetHistory() { state_->ResetHistory(); }
++	void Renderer::ResetHistory() { FoveatedRenderImpl::CropMotion::Invalidate(2, 2); state_->ResetHistory(); }
+ 	bool Renderer::IsFailureLatched() const { return state_->IsFailureLatched(); }
+ 	bool Renderer::IsFailureRecoverable() const { return state_->IsFailureRecoverable(); }
+ 	bool Renderer::IsRecoveryLimited() const { return state_->IsRecoveryLimited(); }
+diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h
+index b4aa8b9..1914a05 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h
++++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h
+@@ -25,6 +25,7 @@ namespace NeuralRendering
+ 			std::uint32_t sourceY = 0;
+ 			float motionVectorScaleX = 1.0f;
+ 			float motionVectorScaleY = 1.0f;
++			bool compensateCropMotion = false;
+ 			};
+ 
+ 			// Optional stable resource envelope for the adaptive regular-crop
+diff --git a/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.cpp b/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.cpp
+index 672e756..d18c50f 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.cpp
+@@ -8,8 +8,11 @@
+ struct RCASConfig
+ {
+ 	float sharpness;
+-	float3 pad;
++	float detailGain;
++	uint32_t stereo;
++	uint32_t pad;
+ };
++static_assert(sizeof(RCASConfig) == 16);
+ 
+ RCAS::~RCAS()
+ {
+@@ -33,11 +36,11 @@ void RCAS::CreateComputeShader()
+ 	rcasComputeShader.attach((ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\Upscaling\\RCAS\\RCAS.hlsl", defines, "cs_5_0"));
+ }
+ 
+-void RCAS::ApplySharpen(ID3D11ShaderResourceView* inputSRV, ID3D11UnorderedAccessView* outputUAV, float sharpness)
++bool RCAS::ApplySharpen(ID3D11ShaderResourceView* inputSRV, ID3D11UnorderedAccessView* outputUAV, float sharpness)
+ {
+-	if (!rcasComputeShader) {
++	if (!rcasComputeShader || !rcasConfigCB || !inputSRV || !outputUAV) {
+ 		logger::warn("[RCAS] Compute shader not compiled");
+-		return;
++		return false;
+ 	}
+ 
+ 	CS_GPU_PASS("Upscaling::RCAS");
+@@ -49,13 +52,16 @@ void RCAS::ApplySharpen(ID3D11ShaderResourceView* inputSRV, ID3D11UnorderedAcces
+ 	D3D11_TEXTURE2D_DESC outputDesc{};
+ 	if (!Util::GetTexture2DDesc(outputUAV, outputDesc)) {
+ 		logger::warn("[RCAS] Could not resolve output texture dimensions");
+-		return;
++		return false;
+ 	}
+ 	uint32_t screenWidth = outputDesc.Width;
+ 	uint32_t screenHeight = outputDesc.Height;
+ 
+ 	RCASConfig config{};
+-	config.sharpness = sharpness;
++	const auto strength = Sharpening::Resolve(sharpness);
++	config.sharpness = strength[0];
++	config.detailGain = strength[1];
++	config.stereo = globals::game::isVR ? 1u : 0u;
+ 
+ 	rcasConfigCB->Update(config);
+ 	auto bufferArray = rcasConfigCB->CB();
+@@ -80,4 +86,5 @@ void RCAS::ApplySharpen(ID3D11ShaderResourceView* inputSRV, ID3D11UnorderedAcces
+ 	context->CSSetUnorderedAccessViews(0, 1, nullUAVs, nullptr);
+ 
+ 	context->CSSetShader(nullptr, nullptr, 0);
++	return true;
+ }
+diff --git a/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.h b/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.h
+index c5b42ae..dba292f 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.h
++++ b/runtime/open-shaders/src/Features/Upscaling/RCAS/RCAS.h
+@@ -2,6 +2,7 @@
+ 
+ #include "../../../Buffer.h"
+ #include "../../../State.h"
++#include "Strength.h"
+ 
+ #include <d3d11_4.h>
+ #include <winrt/base.h>
+@@ -10,7 +11,7 @@
+  * @brief Robust Contrast Adaptive Sharpening (RCAS) implementation.
+  *
+  * Standalone sharpening pass based on AMD FidelityFX FSR1 RCAS algorithm.
+- * Used to apply sharpening to DLSS output in HDR space before tonemapping.
++ * Supports HDR input and the LDR scene before UI composition.
+  */
+ class RCAS
+ {
+@@ -30,9 +31,9 @@ public:
+ 	 *
+ 	 * @param inputTexture SRV of the texture to sharpen (typically kMAIN render target).
+ 	 * @param outputUAV UAV to write sharpened result to.
+-	 * @param sharpness Sharpening strength (0.0 = no sharpening, higher = more sharp).
++	 * @param sharpness UI strength in [0, 5]; values above 1 amplify bounded RCAS detail.
+ 	 */
+-	void ApplySharpen(ID3D11ShaderResourceView* inputTexture, ID3D11UnorderedAccessView* outputUAV, float sharpness);
++	bool ApplySharpen(ID3D11ShaderResourceView* inputTexture, ID3D11UnorderedAccessView* outputUAV, float sharpness);
+ 
+ private:
+ 	void CreateComputeShader();
+diff --git a/runtime/open-shaders/src/Features/Upscaling/RCAS/Strength.h b/runtime/open-shaders/src/Features/Upscaling/RCAS/Strength.h
+new file mode 100644
+index 0000000..31be773
+--- /dev/null
++++ b/runtime/open-shaders/src/Features/Upscaling/RCAS/Strength.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++
++namespace Sharpening
++{
++	inline constexpr float kMaximumStrength = 5.0f;
++
++	/** Sanitizes the UI/configuration strength before rendering. */
++	inline float Sanitize(float strength)
++	{
++		return std::isfinite(strength) ? std::clamp(strength, 0.0f, kMaximumStrength) : 0.0f;
++	}
++
++	/** Keeps the RCAS kernel bounded; extended strength amplifies its resolved detail. */
++	inline std::array<float, 2> Resolve(float strength)
++	{
++		strength = Sanitize(strength);
++		return { strength > 0.0f ? std::exp2(2.0f * std::min(strength, 1.0f) - 2.0f) : 0.0f,
++			std::max(strength, 1.0f) };
++	}
++}
+diff --git a/runtime/open-shaders/src/Features/Upscaling/Streamline.cpp b/runtime/open-shaders/src/Features/Upscaling/Streamline.cpp
+index 17d2034..627317c 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/Streamline.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/Streamline.cpp
+@@ -778,7 +778,7 @@ void Streamline::Upscale(ID3D11Resource* a_upscalingTexture, ID3D11Resource* a_r
+ 	const bool dlssperfSharpen = upscaling.IsPerfModeSharpenRedirectActive();
+ 	ID3D11Resource* colorOut =
+ 		dlssperfActive ? (dlssperfSharpen ? static_cast<ID3D11Resource*>(perfMode.GetRefraTempTex()) : static_cast<ID3D11Resource*>(perfMode.GetTestTexture())) :
+-						 ((upscaling.settings.sharpnessEnabledDLSS && upscaling.settings.sharpnessDLSS > 0.0f && upscaling.sharpenerTexture) ? upscaling.sharpenerTexture->resource.get() : a_upscalingTexture);
++						 ((!FoveatedRenderImpl::Bridge::IsRouteActive() && upscaling.settings.sharpnessEnabledDLSS && upscaling.settings.sharpnessDLSS > 0.0f && upscaling.sharpenerTexture) ? upscaling.sharpenerTexture->resource.get() : a_upscalingTexture);
+ 
+ 	// VR stereo DLSS: NGX D3D11 only accepts zero-offset subrects. Non-zero offsets return
+ 	// FAIL_InvalidParameter because Streamline's dlssEntry.cpp never sets
+diff --git a/runtime/open-shaders/tests/cpp/CMakeLists.txt b/runtime/open-shaders/tests/cpp/CMakeLists.txt
+index 45d1225..36e75b1 100644
+--- a/runtime/open-shaders/tests/cpp/CMakeLists.txt
++++ b/runtime/open-shaders/tests/cpp/CMakeLists.txt
+@@ -70,6 +70,8 @@ add_executable(cpp_tests
+     test_adaptive_crop_controller.cpp
+     test_adaptive_nr_controller.cpp
+     test_gaze_crop_policy.cpp
++    test_crop_motion_history.cpp
++    test_sharpening_strength.cpp
+     # Stub I18n::Get so units-under-test that call T() (Subrect's DrawEditor)
+     # link without pulling the translation loader into the test binary.
+     i18n_stub.cpp
+diff --git a/runtime/open-shaders/tests/cpp/test_crop_motion_history.cpp b/runtime/open-shaders/tests/cpp/test_crop_motion_history.cpp
+new file mode 100644
+index 0000000..736d4a2
+--- /dev/null
++++ b/runtime/open-shaders/tests/cpp/test_crop_motion_history.cpp
+@@ -0,0 +1,36 @@
++#include <catch2/catch_test_macros.hpp>
++#include <catch2/catch_approx.hpp>
++#include <tuple>
++#include "Features/Upscaling/CropMotionHistory.h"
++
++using namespace FoveatedRenderImpl::CropMotion;
++
++TEST_CASE("Moving crop reprojects a stationary sample without resetting", "[gaze][motion]")
++{
++	const History left{ { 100, 80, 800, 600 }, { 1.6f, 1.5f }, 40, true };
++	bool reset = false;
++	const auto offset = Offset(left, { 108, 74, 800, 600 }, left.scale, 41, reset);
++	REQUIRE_FALSE(reset);
++	REQUIRE(offset[0] * 800.0f * 1.6f == Catch::Approx(8.0f));
++	REQUIRE(offset[1] * 600.0f * 1.5f == Catch::Approx(-6.0f));
++	const History right{ { 900, 80, 800, 600 }, left.scale, 40, true };
++	reset = false;
++	const auto rightOffset = Offset(right, { 896, 80, 800, 600 }, right.scale, 41, reset);
++	REQUIRE_FALSE(reset);
++	REQUIRE(rightOffset[0] * 800.0f * 1.6f == Catch::Approx(-4.0f));
++}
++
++TEST_CASE("Crop history breaks at a missing frame, resize, scale change or large gaze jump", "[gaze][motion]")
++{
++	const History previous{ { 100, 80, 800, 600 }, { 1.6f, 1.5f }, 40, true };
++	for (const auto [region, scale, frame] : {
++		std::tuple{ Region{ 108, 80, 800, 600 }, previous.scale, 42u },
++		std::tuple{ Region{ 108, 80, 801, 600 }, previous.scale, 41u },
++		std::tuple{ Region{ 108, 80, 800, 600 }, std::array{ 2.0f, 1.5f }, 41u },
++		std::tuple{ Region{ 301, 80, 800, 600 }, previous.scale, 41u }
++	}) {
++		bool reset = false;
++		REQUIRE((Offset(previous, region, scale, frame, reset) == std::array<float, 2>{}));
++		REQUIRE(reset);
++	}
++}
+diff --git a/runtime/open-shaders/tests/cpp/test_sharpening_strength.cpp b/runtime/open-shaders/tests/cpp/test_sharpening_strength.cpp
+new file mode 100644
+index 0000000..a38f735
+--- /dev/null
++++ b/runtime/open-shaders/tests/cpp/test_sharpening_strength.cpp
+@@ -0,0 +1,27 @@
++#include <catch2/catch_test_macros.hpp>
++#include <catch2/catch_approx.hpp>
++#include <limits>
++#include "Features/Upscaling/RCAS/Strength.h"
++
++TEST_CASE("Extended sharpening keeps the RCAS denominator away from zero", "[sharpening]")
++{
++	float previous = 0.0f;
++	for (int step = 0; step <= 500; ++step) {
++		const auto strength = Sharpening::Resolve(step / 100.0f);
++		REQUIRE(1.0f - 4.0f * 0.1875f * strength[0] >= 0.25f);
++		const float effective = strength[0] * strength[1];
++		REQUIRE(effective >= previous);
++		previous = effective;
++	}
++	REQUIRE(Sharpening::Resolve(1.0f)[0] == Catch::Approx(1.0f));
++	REQUIRE(Sharpening::Resolve(5.0f)[1] == Catch::Approx(5.0f));
++}
++
++TEST_CASE("Invalid sharpening settings cannot reach the GPU", "[sharpening]")
++{
++	REQUIRE(Sharpening::Sanitize(-1.0f) == 0.0f);
++	REQUIRE(Sharpening::Sanitize(100.0f) == 5.0f);
++	REQUIRE(Sharpening::Sanitize(std::numeric_limits<float>::infinity()) == 0.0f);
++	REQUIRE(Sharpening::Sanitize(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
++	REQUIRE(Sharpening::Resolve(0.0f)[0] == 0.0f);
++}
