@@ -1113,7 +1113,7 @@ index 84c9982..bb2640c 100644
  			bool succeeded = Renderer::Instance().ApplyStereo(globals::d3d::device, context,
  				total.texture, inputs, guideWidth, guideHeight,
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
-index 5bb7255..c697c8d 100644
+index 5bb7255..4e9631c 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
 @@ -1,3 +1,4 @@
@@ -1147,7 +1147,42 @@ index 5bb7255..c697c8d 100644
  		bool GetTextureDesc(ID3D11Resource* resource, D3D11_TEXTURE2D_DESC& desc)
  		{
  			Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-@@ -770,6 +752,9 @@ namespace NeuralRendering
+@@ -504,9 +486,6 @@ namespace NeuralRendering
+ 			if (!tuning.adaptiveResolution || !tuning.adaptiveHandoff)
+ 				eye.handoff.valid = false;
+ 			context->CopyResource(eye.color.resource11.Get(), color);
+-			if (tier.reducedResolution && !DispatchModelInput(device, context, eye, tier, colorWidth, colorHeight, modelWidth, modelHeight,
+-				 tuning.modelResolveMode == 1))
+-				return LatchFailure("model input downsample", E_FAIL);
+ 			if (!CopyDepthGuide(context, depthSRV, eye.depth.uav11.Get(), guideWidth, guideHeight))
+ 				return LatchFailure("depth guide conversion", E_FAIL);
+ 			context->CopyResource(eye.motionVectors.resource11.Get(), motionVectors);
+@@ -561,6 +540,11 @@ namespace NeuralRendering
+ 							captureInfo.temporalSkippedSinceFull, captureInfo.temporalNextAnchorReset);
+ 						const bool writeColorPreview = globals::features::openNRCapture.settings.writeColorPreviews;
+ 						if (globals::features::openNRCapture.settings.capturePreNR) {
++							if (tier.reducedResolution && !DispatchModelInput(device, context, eye, tier,
++								colorWidth, colorHeight, modelWidth, modelHeight, tuning.modelResolveMode == 1)) {
++								globals::features::openNRCapture.AbortFrame();
++								return true;
++							}
+ 							ID3D11Resource* modelInput = tier.reducedResolution ? tier.modelInput.resource11.Get() : eye.color.resource11.Get();
+ 							const auto modelInputWidth = tier.reducedResolution ? modelWidth : colorWidth;
+ 							const auto modelInputHeight = tier.reducedResolution ? modelHeight : colorHeight;
+@@ -598,6 +582,12 @@ namespace NeuralRendering
+ 				return true;
+ 			}
+ 
++			// Temporal reuse consumes the full-resolution crop and guides directly.
++			// Build the reduced model input only when this frame will run Feature 18.
++			if (tier.reducedResolution && !DispatchModelInput(device, context, eye, tier,
++				colorWidth, colorHeight, modelWidth, modelHeight, tuning.modelResolveMode == 1))
++				return LatchFailure("model input downsample", E_FAIL);
++
+ 			const bool resetForAnchor = resetPending[eyeIndex][tierIndex] ||
+ 				(temporalSkippedSinceFull && tuning.temporalReuseResetAfterSkip);
+ #if defined(OPENNR_CAPTURE_ENABLED)
+@@ -770,6 +760,9 @@ namespace NeuralRendering
  			if (failureLatched || !device || !context || !color)
  				return false;
  			ID3D11Resource* writeback = destination ? destination : color;
@@ -1157,8 +1192,17 @@ index 5bb7255..c697c8d 100644
  			if (!writeback)
  				return false;
  			CS_GPU_PASS("NeuralRendering::EvaluateStereo");
-@@ -821,7 +806,19 @@ namespace NeuralRendering
- 					return LatchFailure("model input downsample stereo", E_FAIL);
+@@ -812,16 +805,24 @@ namespace NeuralRendering
+ 					input.sourceX + colorWidth, input.sourceY + colorHeight, 1
+ 				};
+ 				auto& eye = eyes[eyeIndex];
+-				auto& tier = eye.tiers[tierIndex];
+ 				if (!tuning.adaptiveResolution || !tuning.adaptiveHandoff)
+ 					eye.handoff.valid = false;
+ 				context->CopySubresourceRegion(eye.color.resource11.Get(), 0, 0, 0, 0, color, 0, &sourceBox);
+-				if (tier.reducedResolution && !DispatchModelInput(device, context, eye, tier, colorWidth, colorHeight, modelWidth, modelHeight,
+-					 tuning.modelResolveMode == 1))
+-					return LatchFailure("model input downsample stereo", E_FAIL);
  				if (!CopyDepthGuide(context, input.depthSRV, eye.depth.uav11.Get(), guideWidth, guideHeight))
  					return LatchFailure("depth guide conversion", E_FAIL);
 -				context->CopyResource(eye.motionVectors.resource11.Get(), input.motionVectors);
@@ -1178,7 +1222,7 @@ index 5bb7255..c697c8d 100644
  			}
  
  			const auto adaptivePrewarm = PrepareAdjacentPrewarmResources(device, tierIndex,
-@@ -835,8 +832,9 @@ namespace NeuralRendering
+@@ -835,8 +836,9 @@ namespace NeuralRendering
  			bool temporalLayoutChanged = false;
  			for (std::uint32_t eyeIndex = 0; eyeIndex < inputs.size(); ++eyeIndex) {
  				const auto& temporal = eyes[eyeIndex].temporal;
@@ -1190,7 +1234,7 @@ index 5bb7255..c697c8d 100644
  					temporalLayoutChanged = true;
  					break;
  				}
-@@ -851,9 +849,9 @@ namespace NeuralRendering
+@@ -851,9 +853,9 @@ namespace NeuralRendering
  			const bool cropTemporalLayout = stableTemporalLayout && !fullEyeTemporalLayout;
  			const bool temporalCandidate = temporalTierSupported && stableTemporalLayout &&
  				CanAttemptTemporalReuse(eyes[0], colorWidth, colorHeight, guideWidth, guideHeight,
@@ -1202,7 +1246,7 @@ index 5bb7255..c697c8d 100644
  				!tuning.adaptiveResolution && !resetPending[0][tierIndex] && !resetPending[1][tierIndex] &&
  				(temporalFrameIndex % tuning.temporalReuseCadence) != 0;
  			if (temporalCandidate) {
-@@ -879,9 +877,10 @@ namespace NeuralRendering
+@@ -879,9 +881,10 @@ namespace NeuralRendering
  						auto& tier = eye.tiers[tierIndex];
  						ID3D11Resource* temporalOutput = tier.reducedResolution ?
  							tier.resolved.Get() : tier.output.resource11.Get();
@@ -1215,7 +1259,36 @@ index 5bb7255..c697c8d 100644
  						} else {
  							context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
  								temporalOutput, 0, &outputBox);
-@@ -1142,11 +1141,12 @@ namespace NeuralRendering
+@@ -932,6 +935,11 @@ namespace NeuralRendering
+ 								auto& tier = eye.tiers[tierIndex];
+ 								ID3D11Resource* temporalOutput = tier.reducedResolution ? tier.resolved.Get() : tier.output.resource11.Get();
+ 								if (globals::features::openNRCapture.settings.capturePreNR) {
++									if (tier.reducedResolution && !DispatchModelInput(device, context, eye, tier,
++										colorWidth, colorHeight, modelWidth, modelHeight, tuning.modelResolveMode == 1)) {
++										globals::features::openNRCapture.AbortFrame();
++										return true;
++									}
+ 									ID3D11Resource* modelInput = tier.reducedResolution ? tier.modelInput.resource11.Get() : eye.color.resource11.Get();
+ 									const auto modelInputWidth = tier.reducedResolution ? modelWidth : colorWidth;
+ 									const auto modelInputHeight = tier.reducedResolution ? modelHeight : colorHeight;
+@@ -971,6 +979,16 @@ namespace NeuralRendering
+ 				}
+ 			}
+ 
++			// Reuse frames only need the full-resolution crop and motion/depth guides.
++			// Downsample for Feature 18 after the reuse route has declined the frame.
++			for (std::uint32_t eyeIndex = 0; eyeIndex < inputs.size(); ++eyeIndex) {
++				auto& eye = eyes[eyeIndex];
++				auto& tier = eye.tiers[tierIndex];
++				if (tier.reducedResolution && !DispatchModelInput(device, context, eye, tier,
++					colorWidth, colorHeight, modelWidth, modelHeight, tuning.modelResolveMode == 1))
++					return LatchFailure("model input downsample stereo", E_FAIL);
++			}
++
+ #if defined(OPENNR_CAPTURE_ENABLED)
+ 			bool captureFrame = false;
+ 			if (globals::features::openNRCapture.settings.enableCapture) {
+@@ -1142,11 +1160,12 @@ namespace NeuralRendering
  						colorWidth, colorHeight, guideWidth, guideHeight,
  						input.motionVectorScaleX, input.motionVectorScaleY,
  						input.sourceX, input.sourceY, tuning);
@@ -1230,7 +1303,7 @@ index 5bb7255..c697c8d 100644
  				} else {
  					context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
  						writebackOutput, 0, &outputBox);
-@@ -1299,12 +1299,13 @@ namespace NeuralRendering
+@@ -1299,12 +1318,13 @@ namespace NeuralRendering
  		bool CanAttemptTemporalReuse(const EyeResources& eye,
  			std::uint32_t colorWidth, std::uint32_t colorHeight,
  			std::uint32_t guideWidth, std::uint32_t guideHeight,
@@ -1246,7 +1319,7 @@ index 5bb7255..c697c8d 100644
  				eye.temporal.base.resource && eye.temporal.base.srv && eye.temporal.base.uav &&
  				eye.temporal.residual.resource && eye.temporal.residual.srv && eye.temporal.residual.uav &&
  				eye.temporal.depth.resource && eye.temporal.depth.srv &&
-@@ -1688,15 +1689,71 @@ namespace NeuralRendering
+@@ -1688,15 +1708,71 @@ namespace NeuralRendering
  					return false;
  			}
  
@@ -1322,7 +1395,7 @@ index 5bb7255..c697c8d 100644
  				Feature18GuideContract guide{};
  				guide.colorWidth = passIndex == 0 ? firstInputWidth : outputWidth;
  				guide.colorHeight = passIndex == 0 ? firstInputHeight : outputHeight;
-@@ -1719,13 +1776,22 @@ namespace NeuralRendering
+@@ -1719,13 +1795,22 @@ namespace NeuralRendering
  					guide.motionWidth <= guide.colorWidth && guide.motionHeight <= guide.colorHeight;
  				const bool succeeded = Runtime::Instance().Execute(commandList, FeatureSlot(eyeIndex, tierIndex, passIndex),
  					input, depth, motionVectors, output, guide, tuning, reset);
@@ -1348,7 +1421,7 @@ index 5bb7255..c697c8d 100644
  		}
  
  		struct ModelResolutionConstants
-@@ -2512,14 +2578,17 @@ namespace NeuralRendering
+@@ -2512,14 +2597,17 @@ namespace NeuralRendering
  		ID3D11Resource* destination, ID3D11UnorderedAccessView* destinationUAV,
  		bool blendSubrect, const StereoResourceEnvelope& resourceEnvelope)
  	{
