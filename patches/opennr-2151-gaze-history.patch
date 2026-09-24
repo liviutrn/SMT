@@ -580,7 +580,7 @@ index 0000000..8842332
 +	}
 +}
 diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
-index 7977eaa..3a2edd4 100644
+index 7977eaa..31eddf7 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
 @@ -9,6 +9,8 @@
@@ -673,7 +673,30 @@ index 7977eaa..3a2edd4 100644
  }
  
  float FoveatedRender::GetRenderScaleForQuality(uint qualityMode)
-@@ -1295,8 +1311,8 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1278,11 +1294,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+ 
+ 			static const char* multiPassModes[] = { "Off", "2x sequential NR", "3x sequential NR" };
+ 			int multiPass = static_cast<int>(std::min(settings.neuralRenderingMultiPass, 2u));
+-			if (ImGui::Combo(T(TKEY("neural_rendering_multi_pass"), "Experimental sequential NR (screenshot/benchmark)"),
++			if (ImGui::Combo(T(TKEY("neural_rendering_multi_pass"), "Experimental sequential NR"),
+ 				&multiPass, multiPassModes, IM_ARRAYSIZE(multiPassModes)))
+ 				settings.neuralRenderingMultiPass = static_cast<uint>(multiPass);
+ 			if (auto _tt = Util::HoverTooltipWrapper())
+-				drawWrapped(T(TKEY("neural_rendering_multi_pass_tooltip"), "Runs NR two or three times with separate resources. This roughly doubles or triples work and is intended for screenshots or benchmarks."));
++				drawWrapped(T(TKEY("neural_rendering_multi_pass_tooltip"), "Runs NR two or three times on each eye's current region, including fixed-size eye-tracked crops. Each pass has separate native history and adds frame time and VRAM use. Cropped regions remain single-pass while adaptive NR resolution is active."));
+ 			if (settings.neuralRenderingMultiPass) {
+ 				if (settings.neuralRenderingMultiPass >= 2)
+ 					drawWarningWrapped(T(TKEY("neural_rendering_multi_pass_warning"), "Experimental 3x: very large frame-time and VRAM increase."));
+@@ -1290,13 +1306,15 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+ 					drawWarningWrapped(T(TKEY("neural_rendering_multi_pass_warning"), "Experimental 2x: major frame-time increase and possible smearing."));
+ 				if (settings.neuralRenderingPreUpscale)
+ 					drawWarningWrapped(T(TKEY("neural_rendering_multi_pass_pre_warning"), "Sequential NR is suppressed while pre-upscale NR is enabled."));
+-				if (globals::game::isVR && !(subrectController.GetUV().IsFullEye() && subrectController.GetRightEyeUV().IsFullEye()))
+-					drawWarningWrapped(T(TKEY("neural_rendering_multi_pass_subrect_warning"), "VR sequential NR is limited to Full Eye mode."));
++				if (globals::game::isVR && settings.neuralRenderingAdaptiveEnabled &&
++					(IsEyeTrackedFoveationEnabled() ||
++						!(subrectController.GetUV().IsFullEye() && subrectController.GetRightEyeUV().IsFullEye())))
++					drawWarningWrapped(T(TKEY("neural_rendering_multi_pass_adaptive_warning"), "Cropped sequential NR uses one pass while adaptive NR resolution is active."));
  			}
  
  			ImGui::SeparatorText(T(TKEY("neural_rendering_temporal_header"), "Temporal Stability"));
@@ -684,7 +707,7 @@ index 7977eaa..3a2edd4 100644
  			int temporalReuseMode = 0;
  			for (int index = 0; index < IM_ARRAYSIZE(temporalReuseValues); ++index) {
  				if (settings.neuralRenderingTemporalReuseCadence == temporalReuseValues[index]) {
-@@ -1304,22 +1320,24 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1304,22 +1322,24 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  					break;
  				}
  			}
@@ -714,7 +737,7 @@ index 7977eaa..3a2edd4 100644
  			}
  
  			ImGui::SeparatorText("Eye-tracked Foveation");
-@@ -1335,6 +1353,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1335,6 +1355,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  				int quantizationPixels = static_cast<int>(std::min(settings.neuralRenderingEyeTrackedQuantizationPixels, 64u));
  				if (ImGui::SliderInt("Crop movement quantization", &quantizationPixels, 0, 64, quantizationPixels == 0 ? "Off" : "%d input px"))
  					settings.neuralRenderingEyeTrackedQuantizationPixels = static_cast<uint>(std::clamp(quantizationPixels, 0, 64));
@@ -726,7 +749,7 @@ index 7977eaa..3a2edd4 100644
  				if (!globals::game::isVR)
  					drawWarningWrapped("Native OpenVR gaze is available only in VR.");
  				else if (GetDlssMode() != DlssMode::kDefault)
-@@ -1342,7 +1365,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1342,7 +1367,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  				else if (subrectController.GetUV().IsFullEye() && subrectController.GetRightEyeUV().IsFullEye())
  					drawWarningWrapped("Select a cropped eye region before enabling moving gaze.");
  				if (settings.neuralRenderingTemporalReuseCadence != 0)
@@ -735,7 +758,7 @@ index 7977eaa..3a2edd4 100644
  
  				const auto gaze = FoveatedRenderImpl::NativeOpenVRGaze::GetDiagnostics();
  				ImGui::TextDisabled("Provider: %s | API: %s | Focus: %s | Native sample: %s",
-@@ -1368,6 +1391,14 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1368,6 +1393,14 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  			}
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
@@ -1197,10 +1220,18 @@ index 677517e..739841b 100644
  
  	struct Diagnostics
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
-index 84c9982..edcfd1b 100644
+index 84c9982..71ec274 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
-@@ -22,13 +22,13 @@ namespace NeuralRendering
+@@ -6,6 +6,7 @@
+ #include "Features/Upscaling/FoveatedRender/Bridge.h"
+ #include "Features/Upscaling/FoveatedRender/Core.h"
+ #include "Features/Upscaling/NativeOpenVRGaze.h"
++#include "RuntimePolicy.h"
+ #include "Features/Upscaling/PerfMode.h"
+ #include "Globals.h"
+ #include "GpuPass.h"
+@@ -22,13 +23,13 @@ namespace NeuralRendering
  	namespace
  	{
  		eastl::unique_ptr<Texture2D> color[2];
@@ -1218,7 +1249,7 @@ index 84c9982..edcfd1b 100644
  		std::uint32_t lastAppliedFrame = UINT32_MAX;
  		bool writebackLogged = false;
  		bool flatRouteWasActive = false;
-@@ -109,9 +109,10 @@ namespace NeuralRendering
+@@ -109,9 +110,10 @@ namespace NeuralRendering
  			return true;
  		}
  
@@ -1231,7 +1262,7 @@ index 84c9982..edcfd1b 100644
  				return false;
  
  			winrt::com_ptr<ID3D11Texture2D> sourceTexture;
-@@ -119,17 +120,19 @@ namespace NeuralRendering
+@@ -119,17 +121,19 @@ namespace NeuralRendering
  				return false;
  			D3D11_TEXTURE2D_DESC sourceDesc{};
  			sourceTexture->GetDesc(&sourceDesc);
@@ -1259,7 +1290,7 @@ index 84c9982..edcfd1b 100644
  			return true;
  		}
  
-@@ -158,7 +161,9 @@ namespace NeuralRendering
+@@ -158,7 +162,9 @@ namespace NeuralRendering
  				settings.neuralRenderingPreUpscale == 0 ? std::min(settings.neuralRenderingMultiPass, 2u) : 0u,
  				// Adaptive NR owns the per-frame model tier and its display-space
  				// handoff. Keep native residual reuse disabled while tiers are moving.
@@ -1270,7 +1301,7 @@ index 84c9982..edcfd1b 100644
  				settings.neuralRenderingTemporalDepthThreshold,
  				settings.neuralRenderingTemporalColorTolerance,
  				settings.neuralRenderingTemporalReuseResetAfterSkip,
-@@ -562,6 +567,7 @@ namespace NeuralRendering
+@@ -562,6 +568,7 @@ namespace NeuralRendering
  			.enabled = foveated.settings.neuralRenderingEyeTrackedFoveation,
  			.smoothingMs = foveated.settings.neuralRenderingEyeTrackedSmoothingMs,
  			.quantizationPixels = foveated.settings.neuralRenderingEyeTrackedQuantizationPixels,
@@ -1278,7 +1309,7 @@ index 84c9982..edcfd1b 100644
  		};
  		const bool gazeRequested = gazeConfig.enabled && foveated.settings.neuralRenderingEnabled &&
  			foveated.GetDlssMode() == FoveatedRender::DlssMode::kDefault &&
-@@ -626,22 +632,9 @@ namespace NeuralRendering
+@@ -626,22 +633,9 @@ namespace NeuralRendering
  			(foveated.IsAdaptiveCropRuntimeActive() || blendMode != FoveatedRender::SubrectBlendMode::kHardCopy);
  		ID3D11Resource* destination = total.texture;
  		ID3D11UnorderedAccessView* destinationUAV = total.UAV;
@@ -1304,7 +1335,7 @@ index 84c9982..edcfd1b 100644
  
  		CS_GPU_PASS("NeuralRendering::FoveatedLdrBeforeUI");
  		ID3D11RenderTargetView* savedRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-@@ -666,8 +659,37 @@ namespace NeuralRendering
+@@ -666,28 +660,46 @@ namespace NeuralRendering
  				.sourceY = y,
  				.motionVectorScaleX = motionScaleX * guideWidth,
  				.motionVectorScaleY = motionScaleY * guideHeight,
@@ -1323,7 +1354,7 @@ index 84c9982..edcfd1b 100644
 +				}
 +				const D3D11_BOX cropBox{ inputs[eye].sourceX, inputs[eye].sourceY, 0,
 +					inputs[eye].sourceX + outWidth, inputs[eye].sourceY + outHeight, 1 };
-+				context->CopySubresourceRegion(target->resource.get(), 0, 0, 0, total.texture, 0, &cropBox);
++				context->CopySubresourceRegion(target->resource.get(), 0, 0, 0, 0, total.texture, 0, &cropBox);
 +				inputs[eye].writebackTarget = target->resource.get();
 +				inputs[eye].writebackUAV = target->uav.get();
 +			}
@@ -1342,20 +1373,21 @@ index 84c9982..edcfd1b 100644
  		Tuning tuning = GetTuning(foveated, true);
  		if (!fullEye && tuning.adaptiveResolution && !tuning.adaptiveHandoff && !adaptiveCropHandoffDisabledLogged) {
  			logger::info("[DLSSNR] adaptive NR history handoff disabled while adaptive crop is active; using current-frame crop feathering");
-@@ -678,16 +700,13 @@ namespace NeuralRendering
- 			// keep cropped/foveated regions on the established single-pass route.
- 		{
- 			tuning.multiPass = 0;
+ 			adaptiveCropHandoffDisabledLogged = true;
+ 		}
+-		if (!fullEye)
+-			// The cascade relies on full-eye dimensions and isolated stage history;
+-			// keep cropped/foveated regions on the established single-pass route.
+-		{
+-			tuning.multiPass = 0;
 -			// A fixed crop now owns crop-local temporal history in the renderer. Do
 -			// not attempt reuse while an eye-tracked crop is moving: its local origin
 -			// changes every frame and must first be handled by an explicit crop-origin
 -			// transform. Adaptive crop already supplies cadence zero through GetTuning.
 -			if (gaze.dynamic)
 -				tuning.temporalReuseCadence = 0;
-+			// Dynamic gaze may use residual reuse when the crop-motion transform is
-+			// active. Larger jumps set resetPending and force a full NR anchor.
-+			// Adaptive crop still supplies cadence zero through GetTuning.
- 		}
+-		}
++		tuning.multiPass = ResolveMultiPassMode(tuning.multiPass, !fullEye, tuning.adaptiveResolution);
  			bool succeeded = Renderer::Instance().ApplyStereo(globals::d3d::device, context,
  				total.texture, inputs, guideWidth, guideHeight,
 -				outWidth, outHeight, tuning, destination, destinationUAV, wantsEdgeBlend && destinationUAV != nullptr,
@@ -1363,7 +1395,7 @@ index 84c9982..edcfd1b 100644
  				resourceEnvelope);
  			if (!succeeded && resourceEnvelope.IsValid() &&
  				Renderer::Instance().IsFailureRecoverable()) {
-@@ -702,21 +721,33 @@ namespace NeuralRendering
+@@ -702,21 +714,33 @@ namespace NeuralRendering
  					++FoveatedRenderImpl::Core::vrSubrectNeuralFallbackEntries;
  					FoveatedRenderImpl::Core::InvalidateTemporalState();
  					resourceEnvelope.enabled = false;
@@ -1371,7 +1403,7 @@ index 84c9982..edcfd1b 100644
 +						for (std::uint32_t eye = 0; eye < inputs.size(); ++eye) {
 +							const D3D11_BOX cropBox{ inputs[eye].sourceX, inputs[eye].sourceY, 0,
 +								inputs[eye].sourceX + outWidth, inputs[eye].sourceY + outHeight, 1 };
-+							context->CopySubresourceRegion(eyeBlendTargets[eye]->resource.get(), 0, 0, 0,
++							context->CopySubresourceRegion(eyeBlendTargets[eye]->resource.get(), 0, 0, 0, 0,
 +								total.texture, 0, &cropBox);
 +						}
 +					}
@@ -1401,7 +1433,7 @@ index 84c9982..edcfd1b 100644
  					(destinationUAV ? "direct-uav" : "direct-copy");
  				logger::info("[DLSSNR] LDR output written before UI composite size={}x{} edgeBlend={} mode={} path={} gazeCrop={} batchedAsync=true",
  					outWidth, outHeight, wantsEdgeBlend && destinationUAV != nullptr,
-@@ -746,11 +777,13 @@ namespace NeuralRendering
+@@ -746,11 +770,13 @@ namespace NeuralRendering
  		temporalSuppressed = false;
  		color[0].reset();
  		color[1].reset();
@@ -2231,10 +2263,10 @@ index 5bb7255..7ebfd75 100644
  	bool Renderer::IsFailureRecoverable() const { return state_->IsFailureRecoverable(); }
  	bool Renderer::IsRecoveryLimited() const { return state_->IsRecoveryLimited(); }
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h
-index b4aa8b9..f4eeb36 100644
+index b4aa8b9..71943b8 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.h
-@@ -16,15 +16,21 @@ namespace NeuralRendering
+@@ -16,22 +16,28 @@ namespace NeuralRendering
  	class Renderer
  	{
  	public:
@@ -2253,10 +2285,40 @@ index b4aa8b9..f4eeb36 100644
  			std::uint32_t sourceY = 0;
  			float motionVectorScaleX = 1.0f;
  			float motionVectorScaleY = 1.0f;
+-			};
 +			bool compensateCropMotion = false;
- 			};
++		};
  
- 			// Optional stable resource envelope for the adaptive regular-crop
+-			// Optional stable resource envelope for the adaptive regular-crop
+-			// experiment. The current guide/color extents remain explicit in the
+-			// ApplyStereo arguments; these dimensions describe only the backing
+-			// resources that may safely be reused while that valid region changes.
+-			struct StereoResourceEnvelope
++		// Optional stable resource envelope for the adaptive regular-crop
++		// experiment. The current guide/color extents remain explicit in the
++		// ApplyStereo arguments; these dimensions describe only the backing
++		// resources that may safely be reused while that valid region changes.
++		struct StereoResourceEnvelope
+ 			{
+ 				bool enabled = false;
+ 				std::uint32_t guideWidth = 0;
+@@ -63,11 +69,11 @@ namespace NeuralRendering
+ 			std::uint32_t guideWidth, std::uint32_t guideHeight,
+ 			std::uint32_t colorWidth, std::uint32_t colorHeight, const Tuning& tuning,
+ 			// Optional separate writeback target. The input remains `color`; this is
+-				// needed when a cropped NR result must be feathered over its background.
+-				ID3D11Resource* destination = nullptr,
+-				ID3D11UnorderedAccessView* destinationUAV = nullptr,
+-				bool blendSubrect = false,
+-				const StereoResourceEnvelope& resourceEnvelope = {});
++			// needed when a cropped NR result must be feathered over its background.
++			ID3D11Resource* destination = nullptr,
++			ID3D11UnorderedAccessView* destinationUAV = nullptr,
++			bool blendSubrect = false,
++			const StereoResourceEnvelope& resourceEnvelope = {});
+ 		/** @brief Drops cached standalone neural-rendering shaders so they recompile on the next frame. */
+ 		void ClearShaderCache();
+ 		/** @brief Resets the native renderer; false means the GPU fence could not be drained safely. */
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Runtime.h b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Runtime.h
 index b6b5850..d27fa7f 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Runtime.h
@@ -2287,6 +2349,26 @@ index b6b5850..d27fa7f 100644
  		// Opt-in adaptive-resolution handoff. The controller changes only the
  		// native NR tier; the display/compositor cadence remains owned by VR.
  		bool adaptiveResolution = false;
+diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/RuntimePolicy.h b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/RuntimePolicy.h
+index 500a608..85ed0af 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/RuntimePolicy.h
++++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/RuntimePolicy.h
+@@ -4,6 +4,15 @@
+ 
+ namespace NeuralRendering
+ {
++	/** @brief Keeps cropped sequential NR on a stable model tier. */
++	[[nodiscard]] constexpr std::uint32_t ResolveMultiPassMode(std::uint32_t requestedMode,
++		bool cropped, bool adaptiveResolution)
++	{
++		if (cropped && adaptiveResolution)
++			return 0;
++		return requestedMode > 2 ? 2 : requestedMode;
++	}
++
+ 	/** @brief Separates a model-tier change from changes that invalidate display-space handoff history. */
+ 	struct TemporalHistoryConfig
+ 	{
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/TemporalStereoSchedule.h b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/TemporalStereoSchedule.h
 new file mode 100644
 index 0000000..de46ac7
@@ -2457,15 +2539,16 @@ index f95f80e..b66f18a 100644
  		const auto gaze = FoveatedRenderImpl::NativeOpenVRGaze::ResolveForFrame(config, leftUV, rightUV,
  			frameInfo.renderWidth / 2, frameInfo.renderHeight, globals::state->frameCount,
 diff --git a/runtime/open-shaders/tests/cpp/CMakeLists.txt b/runtime/open-shaders/tests/cpp/CMakeLists.txt
-index 45d1225..4753cf5 100644
+index 45d1225..a6c16ee 100644
 --- a/runtime/open-shaders/tests/cpp/CMakeLists.txt
 +++ b/runtime/open-shaders/tests/cpp/CMakeLists.txt
-@@ -70,6 +70,9 @@ add_executable(cpp_tests
+@@ -70,6 +70,10 @@ add_executable(cpp_tests
      test_adaptive_crop_controller.cpp
      test_adaptive_nr_controller.cpp
      test_gaze_crop_policy.cpp
 +    test_crop_motion_history.cpp
 +    test_temporal_stereo_schedule.cpp
++    test_sequential_nr_policy.cpp
 +    test_sharpening_strength.cpp
      # Stub I18n::Get so units-under-test that call T() (Subrect's DrawEditor)
      # link without pulling the translation loader into the test binary.
@@ -2547,6 +2630,32 @@ index de1e08e..f6b617f 100644
  TEST_CASE("Gaze pursuit and saccades bypass saved smoothing", "[gaze]")
  {
  	for (const float smoothing : { 0.0f, 20.0f, 250.0f }) {
+diff --git a/runtime/open-shaders/tests/cpp/test_sequential_nr_policy.cpp b/runtime/open-shaders/tests/cpp/test_sequential_nr_policy.cpp
+new file mode 100644
+index 0000000..09d6761
+--- /dev/null
++++ b/runtime/open-shaders/tests/cpp/test_sequential_nr_policy.cpp
+@@ -0,0 +1,20 @@
++#include "Features/Upscaling/NeuralRendering/RuntimePolicy.h"
++#include <catch2/catch_test_macros.hpp>
++
++using NeuralRendering::ResolveMultiPassMode;
++
++TEST_CASE("Sequential NR remains enabled for fixed-size static and eye-tracked crops", "[nr][foveated]")
++{
++	REQUIRE(ResolveMultiPassMode(1, true, false) == 1);
++	REQUIRE(ResolveMultiPassMode(2, true, false) == 2);
++	REQUIRE(ResolveMultiPassMode(1, false, false) == 1);
++}
++
++TEST_CASE("Cropped sequential NR stays single-pass during adaptive resolution", "[nr][foveated][adaptive]")
++{
++	REQUIRE(ResolveMultiPassMode(1, true, true) == 0);
++	REQUIRE(ResolveMultiPassMode(2, true, true) == 0);
++	REQUIRE(ResolveMultiPassMode(2, false, true) == 2);
++	REQUIRE(ResolveMultiPassMode(0, true, false) == 0);
++	REQUIRE(ResolveMultiPassMode(3, false, false) == 2);
++}
 diff --git a/runtime/open-shaders/tests/cpp/test_sharpening_strength.cpp b/runtime/open-shaders/tests/cpp/test_sharpening_strength.cpp
 new file mode 100644
 index 0000000..a38f735
