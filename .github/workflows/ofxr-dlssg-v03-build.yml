@@ -26,24 +26,41 @@ jobs:
           [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64))
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           $expected = '444bf75bb4bfa43900ac5797ee7c8c7862393514c8146474a66ea2519375de44'
-          Write-Host "POC SHA256: $hash"
+          Write-Host "POC baseline SHA256: $hash"
           if ($hash -ne $expected) { throw "POC package hash mismatch: expected $expected, got $hash" }
           $pkg = Join-Path $env:RUNNER_TEMP 'poc'
           Expand-Archive -Path $zip -DestinationPath $pkg -Force
           $root = Join-Path $pkg 'OFXR_DLSSG_POC_v0.3'
-          # Final static-audit hotfix: HLSL GeneratedFrame is t2, so the copy
-          # root descriptor must also start at t2. Verify the exact resulting
-          # source hash before compiling so this cannot silently drift.
           $cpp = Join-Path $root 'files/src/d3d12/dlssg_poc.cpp'
-          $text = Get-Content -Raw $cpp
-          if (!$text.Contains('copy_srv.BaseShaderRegister = 1;')) { throw 'Expected pre-hotfix t1 root binding not found' }
-          $text = $text.Replace('// Copy root: generated frame SRV at t1.', '// Copy root: generated frame SRV at t2 (matches dlssg_poc.hlsl).')
-          $text = $text.Replace('copy_srv.BaseShaderRegister = 1;', 'copy_srv.BaseShaderRegister = 2;')
-          Set-Content -Path $cpp -Value $text -NoNewline -Encoding utf8
+
+          # Apply the two findings from the final static/first-compiler audit
+          # using Python so the exact LF/UTF-8 bytes are deterministic.
+          $env:OFXR_DLSSG_CPP = $cpp
+          @'
+          from pathlib import Path
+          import os
+          p = Path(os.environ['OFXR_DLSSG_CPP'])
+          s = p.read_text(encoding='utf-8')
+          if s.count('copy_srv.BaseShaderRegister = 1;') != 1:
+              raise SystemExit('expected pre-hotfix t1 root binding not found')
+          s = s.replace('// Copy root: generated frame SRV at t1.',
+                        '// Copy root: generated frame SRV at t2 (matches dlssg_poc.hlsl).')
+          s = s.replace('copy_srv.BaseShaderRegister = 1;',
+                        'copy_srv.BaseShaderRegister = 2;')
+          old = '''    } __except(EXCEPTION_EXECUTE_HANDLER) {\n        if (exception_code != nullptr) *exception_code = GetExceptionCode();\n        return NVSDK_NGX_Result_FAIL_PlatformError;\n    }'''
+          new = '''    } __except(\n        (exception_code != nullptr ? (*exception_code = GetExceptionCode()) : 0,\n         EXCEPTION_EXECUTE_HANDLER)) {\n        return NVSDK_NGX_Result_FAIL_PlatformError;\n    }'''
+          if s.count(old) != 2:
+              raise SystemExit(f'expected two pre-hotfix SEH handlers, found {s.count(old)}')
+          s = s.replace(old, new)
+          p.write_text(s, encoding='utf-8', newline='\n')
+          '@ | py -
+          if ($LASTEXITCODE -ne 0) { throw 'v0.3 final source hotfix failed' }
+
           $cppHash = (Get-FileHash $cpp -Algorithm SHA256).Hash.ToLowerInvariant()
-          $expectedCpp = 'a64919abd5ff76a5a9416c90bd949b7f7a4f6d46e90ed457d1db936880b4e37c'
-          if ($cppHash -ne $expectedCpp) { throw "Corrected dlssg_poc.cpp hash mismatch: $cppHash" }
-          Add-Content -Path (Join-Path $root 'AUDIT.md') -Value "`n### Final t2 root-binding correction`nThe final Windows build maps the generated-frame descriptor table to t2, matching the HLSL declaration. Corrected source SHA-256: $cppHash.`n"
+          $expectedCpp = '891c00081ecfa892038d08d3bb4435af6fbefe132a778a523f26f5fcdc1dc19f'
+          Write-Host "Final dlssg_poc.cpp SHA256: $cppHash"
+          if ($cppHash -ne $expectedCpp) { throw "Corrected dlssg_poc.cpp hash mismatch: expected $expectedCpp, got $cppHash" }
+          Add-Content -Path (Join-Path $root 'AUDIT.md') -Value "`n### Final pre-build corrections`nThe Windows build maps GeneratedFrame to t2 and evaluates GetExceptionCode() in the MSVC __except filter. Final helper SHA-256: $cppHash.`n"
           py -m py_compile (Join-Path $root 'apply_dlssg_poc.py')
           if ($LASTEXITCODE -ne 0) { throw "POC patcher Python syntax check failed" }
 
@@ -63,8 +80,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "POC patcher failed" }
           git -C ofxr diff --check
           if ($LASTEXITCODE -ne 0) { throw "Patched source failed git diff --check" }
-          $diff = git -C ofxr diff --stat
-          Write-Host $diff
+          git -C ofxr diff --stat
 
       - name: Build Release x64
         shell: pwsh
