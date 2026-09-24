@@ -467,10 +467,10 @@ index 0000000..ecede95
 +}
 diff --git a/runtime/open-shaders/src/Features/Upscaling/CropMotionHistory.h b/runtime/open-shaders/src/Features/Upscaling/CropMotionHistory.h
 new file mode 100644
-index 0000000..903800b
+index 0000000..8842332
 --- /dev/null
 +++ b/runtime/open-shaders/src/Features/Upscaling/CropMotionHistory.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,46 @@
 +#pragma once
 +
 +#include <array>
@@ -492,6 +492,13 @@ index 0000000..903800b
 +		bool valid = false;
 +	};
 +
++	/** Permit crop-local history to cross origins only when motion carries the matching crop delta. */
++	inline bool OriginCompatible(std::uint32_t previousX, std::uint32_t previousY,
++		std::uint32_t currentX, std::uint32_t currentY, bool originCompensated)
++	{
++		return originCompensated || (previousX == currentX && previousY == currentY);
++	}
++
 +	/** Convert current-to-previous crop displacement to stored motion-vector units. */
 +	inline std::array<float, 2> Offset(const History& previous, const Region& current,
 +		std::array<float, 2> scale, std::uint32_t frame, bool& reset)
@@ -511,7 +518,7 @@ index 0000000..903800b
 +	}
 +}
 diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
-index 7977eaa..03e1d1c 100644
+index 7977eaa..d4f3dcc 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
 @@ -9,6 +9,8 @@
@@ -589,6 +596,15 @@ index 7977eaa..03e1d1c 100644
  }
  
  float FoveatedRender::GetRenderScaleForQuality(uint qualityMode)
+@@ -1308,7 +1324,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+ 				&temporalReuseMode, temporalReuseModes, IM_ARRAYSIZE(temporalReuseModes)))
+ 				settings.neuralRenderingTemporalReuseCadence = temporalReuseValues[temporalReuseMode];
+ 			if (auto _tt = Util::HoverTooltipWrapper())
+-				drawWrapped(T(TKEY("neural_rendering_temporal_mode_tooltip"), "Runs a full Feature 18 pass every Nth frame and reuses its residual between passes. Supports 100% single-pass Full Eye or a stable fixed crop; moving/adaptive crop origins disable reuse."));
++				drawWrapped(T(TKEY("neural_rendering_temporal_mode_tooltip"), "Runs a full Feature 18 pass every Nth frame and reuses its residual between passes. Supports 100% single-pass Full Eye, stable fixed crops, and eye-tracked crops with motion-compensated origin shifts. Adaptive crops disable reuse."));
+ 			if (settings.neuralRenderingTemporalReuseCadence != 0) {
+ 				ImGui::SliderFloat(T(TKEY("neural_rendering_temporal_depth_threshold"), "Depth rejection threshold"),
+ 					&settings.neuralRenderingTemporalDepthThreshold, 0.0f, 0.25f, "%.3f");
 @@ -1335,6 +1351,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  				int quantizationPixels = static_cast<int>(std::min(settings.neuralRenderingEyeTrackedQuantizationPixels, 64u));
  				if (ImGui::SliderInt("Crop movement quantization", &quantizationPixels, 0, 64, quantizationPixels == 0 ? "Off" : "%d input px"))
@@ -601,6 +617,15 @@ index 7977eaa..03e1d1c 100644
  				if (!globals::game::isVR)
  					drawWarningWrapped("Native OpenVR gaze is available only in VR.");
  				else if (GetDlssMode() != DlssMode::kDefault)
+@@ -1342,7 +1363,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+ 				else if (subrectController.GetUV().IsFullEye() && subrectController.GetRightEyeUV().IsFullEye())
+ 					drawWarningWrapped("Select a cropped eye region before enabling moving gaze.");
+ 				if (settings.neuralRenderingTemporalReuseCadence != 0)
+-					drawWarningWrapped("Temporal residual reuse is disabled while this crop moves; use a fixed crop for the N2 test.");
++					drawWarningWrapped("Eye-tracked N2/N3/N4 reprojects residuals across compensated crop shifts. Large jumps force a full NR anchor; watch for ghosting or gaze-edge trails.");
+ 
+ 				const auto gaze = FoveatedRenderImpl::NativeOpenVRGaze::GetDiagnostics();
+ 				ImGui::TextDisabled("Provider: %s | API: %s | Focus: %s | Native sample: %s",
 @@ -1368,6 +1389,14 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  			}
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
@@ -1041,7 +1066,7 @@ index 677517e..739841b 100644
  
  	struct Diagnostics
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
-index 84c9982..19bb486 100644
+index 84c9982..bb2640c 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
 @@ -562,6 +562,7 @@ namespace NeuralRendering
@@ -1067,12 +1092,28 @@ index 84c9982..19bb486 100644
  				.sourceY = y,
  				.motionVectorScaleX = motionScaleX * guideWidth,
  				.motionVectorScaleY = motionScaleY * guideHeight,
-+				.compensateCropMotion = gazeConfig.enabled && !fullEye,
++				.compensateCropMotion = gaze.dynamic && !fullEye,
  			};
  		}
  		Tuning tuning = GetTuning(foveated, true);
+@@ -678,12 +682,9 @@ namespace NeuralRendering
+ 			// keep cropped/foveated regions on the established single-pass route.
+ 		{
+ 			tuning.multiPass = 0;
+-			// A fixed crop now owns crop-local temporal history in the renderer. Do
+-			// not attempt reuse while an eye-tracked crop is moving: its local origin
+-			// changes every frame and must first be handled by an explicit crop-origin
+-			// transform. Adaptive crop already supplies cadence zero through GetTuning.
+-			if (gaze.dynamic)
+-				tuning.temporalReuseCadence = 0;
++			// Dynamic gaze may use residual reuse when the crop-motion transform is
++			// active. Larger jumps set resetPending and force a full NR anchor.
++			// Adaptive crop still supplies cadence zero through GetTuning.
+ 		}
+ 			bool succeeded = Renderer::Instance().ApplyStereo(globals::d3d::device, context,
+ 				total.texture, inputs, guideWidth, guideHeight,
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
-index 5bb7255..1ca1957 100644
+index 5bb7255..c697c8d 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
 @@ -1,3 +1,4 @@
@@ -1137,7 +1178,31 @@ index 5bb7255..1ca1957 100644
  			}
  
  			const auto adaptivePrewarm = PrepareAdjacentPrewarmResources(device, tierIndex,
-@@ -879,9 +876,10 @@ namespace NeuralRendering
+@@ -835,8 +832,9 @@ namespace NeuralRendering
+ 			bool temporalLayoutChanged = false;
+ 			for (std::uint32_t eyeIndex = 0; eyeIndex < inputs.size(); ++eyeIndex) {
+ 				const auto& temporal = eyes[eyeIndex].temporal;
+-				if (temporal.valid &&
+-					(temporal.regionX != inputs[eyeIndex].sourceX || temporal.regionY != inputs[eyeIndex].sourceY)) {
++				const auto& input = inputs[eyeIndex];
++				if (temporal.valid && !FoveatedRenderImpl::CropMotion::OriginCompatible(
++					temporal.regionX, temporal.regionY, input.sourceX, input.sourceY, input.compensateCropMotion)) {
+ 					temporalLayoutChanged = true;
+ 					break;
+ 				}
+@@ -851,9 +849,9 @@ namespace NeuralRendering
+ 			const bool cropTemporalLayout = stableTemporalLayout && !fullEyeTemporalLayout;
+ 			const bool temporalCandidate = temporalTierSupported && stableTemporalLayout &&
+ 				CanAttemptTemporalReuse(eyes[0], colorWidth, colorHeight, guideWidth, guideHeight,
+-					inputs[0].sourceX, inputs[0].sourceY) &&
++					inputs[0].sourceX, inputs[0].sourceY, inputs[0].compensateCropMotion) &&
+ 				CanAttemptTemporalReuse(eyes[1], colorWidth, colorHeight, guideWidth, guideHeight,
+-					inputs[1].sourceX, inputs[1].sourceY) &&
++					inputs[1].sourceX, inputs[1].sourceY, inputs[1].compensateCropMotion) &&
+ 				!tuning.adaptiveResolution && !resetPending[0][tierIndex] && !resetPending[1][tierIndex] &&
+ 				(temporalFrameIndex % tuning.temporalReuseCadence) != 0;
+ 			if (temporalCandidate) {
+@@ -879,9 +877,10 @@ namespace NeuralRendering
  						auto& tier = eye.tiers[tierIndex];
  						ID3D11Resource* temporalOutput = tier.reducedResolution ?
  							tier.resolved.Get() : tier.output.resource11.Get();
@@ -1150,7 +1215,7 @@ index 5bb7255..1ca1957 100644
  						} else {
  							context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
  								temporalOutput, 0, &outputBox);
-@@ -1142,11 +1140,12 @@ namespace NeuralRendering
+@@ -1142,11 +1141,12 @@ namespace NeuralRendering
  						colorWidth, colorHeight, guideWidth, guideHeight,
  						input.motionVectorScaleX, input.motionVectorScaleY,
  						input.sourceX, input.sourceY, tuning);
@@ -1165,7 +1230,23 @@ index 5bb7255..1ca1957 100644
  				} else {
  					context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
  						writebackOutput, 0, &outputBox);
-@@ -1688,15 +1687,71 @@ namespace NeuralRendering
+@@ -1299,12 +1299,13 @@ namespace NeuralRendering
+ 		bool CanAttemptTemporalReuse(const EyeResources& eye,
+ 			std::uint32_t colorWidth, std::uint32_t colorHeight,
+ 			std::uint32_t guideWidth, std::uint32_t guideHeight,
+-			std::uint32_t regionX, std::uint32_t regionY) const
++			std::uint32_t regionX, std::uint32_t regionY, bool originCompensated = false) const
+ 		{
+ 			return eye.temporal.valid &&
+ 				eye.temporal.width == colorWidth && eye.temporal.height == colorHeight &&
+ 				eye.temporal.guideWidth == guideWidth && eye.temporal.guideHeight == guideHeight &&
+-				eye.temporal.regionX == regionX && eye.temporal.regionY == regionY &&
++				FoveatedRenderImpl::CropMotion::OriginCompatible(
++					eye.temporal.regionX, eye.temporal.regionY, regionX, regionY, originCompensated) &&
+ 				eye.temporal.base.resource && eye.temporal.base.srv && eye.temporal.base.uav &&
+ 				eye.temporal.residual.resource && eye.temporal.residual.srv && eye.temporal.residual.uav &&
+ 				eye.temporal.depth.resource && eye.temporal.depth.srv &&
+@@ -1688,15 +1689,71 @@ namespace NeuralRendering
  					return false;
  			}
  
@@ -1241,7 +1322,7 @@ index 5bb7255..1ca1957 100644
  				Feature18GuideContract guide{};
  				guide.colorWidth = passIndex == 0 ? firstInputWidth : outputWidth;
  				guide.colorHeight = passIndex == 0 ? firstInputHeight : outputHeight;
-@@ -1719,13 +1774,22 @@ namespace NeuralRendering
+@@ -1719,13 +1776,22 @@ namespace NeuralRendering
  					guide.motionWidth <= guide.colorWidth && guide.motionHeight <= guide.colorHeight;
  				const bool succeeded = Runtime::Instance().Execute(commandList, FeatureSlot(eyeIndex, tierIndex, passIndex),
  					input, depth, motionVectors, output, guide, tuning, reset);
@@ -1267,7 +1348,7 @@ index 5bb7255..1ca1957 100644
  		}
  
  		struct ModelResolutionConstants
-@@ -2512,14 +2576,17 @@ namespace NeuralRendering
+@@ -2512,14 +2578,17 @@ namespace NeuralRendering
  		ID3D11Resource* destination, ID3D11UnorderedAccessView* destinationUAV,
  		bool blendSubrect, const StereoResourceEnvelope& resourceEnvelope)
  	{
@@ -1460,16 +1541,23 @@ index 45d1225..36e75b1 100644
      i18n_stub.cpp
 diff --git a/runtime/open-shaders/tests/cpp/test_crop_motion_history.cpp b/runtime/open-shaders/tests/cpp/test_crop_motion_history.cpp
 new file mode 100644
-index 0000000..736d4a2
+index 0000000..723fec6
 --- /dev/null
 +++ b/runtime/open-shaders/tests/cpp/test_crop_motion_history.cpp
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,43 @@
 +#include <catch2/catch_test_macros.hpp>
 +#include <catch2/catch_approx.hpp>
 +#include <tuple>
 +#include "Features/Upscaling/CropMotionHistory.h"
 +
 +using namespace FoveatedRenderImpl::CropMotion;
++
++TEST_CASE("Temporal crop history crosses an origin shift only with compensated motion", "[gaze][motion]")
++{
++	REQUIRE(OriginCompatible(100, 80, 100, 80, false));
++	REQUIRE_FALSE(OriginCompatible(100, 80, 108, 74, false));
++	REQUIRE(OriginCompatible(100, 80, 108, 74, true));
++}
 +
 +TEST_CASE("Moving crop reprojects a stationary sample without resetting", "[gaze][motion]")
 +{
