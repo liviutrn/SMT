@@ -1,0 +1,87 @@
+name: OFXR DLSSG POC v0.2 Windows build
+
+on:
+  push:
+    branches:
+      - ofxr-dlssg-build-v02
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout build branch
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and verify audited POC package
+        shell: pwsh
+        run: |
+          $parts = 1..5 | ForEach-Object { Get-Content -Raw "ofxr-dlssg-build/poc.b64.$_" }
+          $b64 = ($parts -join '').Trim()
+          $zip = Join-Path $env:RUNNER_TEMP 'OFXR_DLSSG_POC_v0.2.zip'
+          [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64))
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = 'fa51eb0635fc4b85d3c52beb780f936248ccf9df4104ee4bc7c5d442b8c56138'
+          Write-Host "POC SHA256: $hash"
+          if ($hash -ne $expected) { throw "POC package hash mismatch: expected $expected, got $hash" }
+          $pkg = Join-Path $env:RUNNER_TEMP 'poc'
+          Expand-Archive -Path $zip -DestinationPath $pkg -Force
+
+      - name: Clone exact OFXR base
+        shell: pwsh
+        run: |
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr
+          git -C ofxr checkout dad56acafc6e1dde219940427738b926cf2ea555
+          $head = (git -C ofxr rev-parse HEAD).Trim()
+          if ($head -ne 'dad56acafc6e1dde219940427738b926cf2ea555') { throw "Unexpected OFXR HEAD $head" }
+
+      - name: Apply DLSS-G VR POC patch
+        shell: pwsh
+        run: |
+          $patcher = Join-Path $env:RUNNER_TEMP 'poc/OFXR_DLSSG_POC_v0.2/apply_dlssg_poc.py'
+          py $patcher (Resolve-Path 'ofxr').Path
+          if ($LASTEXITCODE -ne 0) { throw "POC patcher failed" }
+          git -C ofxr diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Patched source failed git diff --check" }
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $builder = Join-Path $env:RUNNER_TEMP 'poc/OFXR_DLSSG_POC_v0.2/build_poc.ps1'
+          & $builder -Source (Resolve-Path 'ofxr').Path -Build 'build-dlssg-poc'
+          if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
+
+      - name: Package compiled prototype
+        shell: pwsh
+        run: |
+          $release = Join-Path (Resolve-Path 'ofxr').Path 'build-dlssg-poc/Release'
+          $required = @(
+            (Join-Path $release 'OFXRBridgeTray.exe'),
+            (Join-Path $release 'ofxr/XR_APILAYER_XRFrameBridge_diagnostic.dll'),
+            (Join-Path $release 'ofxr/ofxr_bridge.ini'),
+            (Join-Path $release 'ofxr/nvngx_dlssg.dll')
+          )
+          foreach ($f in $required) {
+            if (!(Test-Path $f)) { throw "Missing build output: $f" }
+            Get-Item $f | Format-List FullName,Length,LastWriteTime
+          }
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item (Join-Path $release 'OFXRBridgeTray.exe') $dist
+          Copy-Item (Join-Path $release 'ofxr') $dist -Recurse
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'poc/OFXR_DLSSG_POC_v0.2/README.md') $dist
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'poc/OFXR_DLSSG_POC_v0.2/AUDIT.md') $dist
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath 'OFXR_DLSSG_POC_v0.2_COMPILED.zip' -Force
+          Get-FileHash 'OFXR_DLSSG_POC_v0.2_COMPILED.zip' -Algorithm SHA256
+
+      - name: Upload compiled prototype
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR_DLSSG_POC_v0.2_COMPILED
+          path: OFXR_DLSSG_POC_v0.2_COMPILED.zip
+          if-no-files-found: error
+          retention-days: 7
