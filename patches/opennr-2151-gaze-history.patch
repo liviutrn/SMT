@@ -136,7 +136,7 @@ index 382adea..49c0a07 100644
 +	Dest[DTid.xy] = float4(saturate(resolved) * normalization, center.a);
  }
 diff --git a/runtime/open-shaders/src/Features/Upscaling.cpp b/runtime/open-shaders/src/Features/Upscaling.cpp
-index 77fed79..6eaba2f 100644
+index 77fed79..ac7e20c 100644
 --- a/runtime/open-shaders/src/Features/Upscaling.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling.cpp
 @@ -48,6 +48,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
@@ -165,24 +165,25 @@ index 77fed79..6eaba2f 100644
  
  		const char* presets[] = {
  			T(TKEY("dlss_model_preset_default"), "Default"),
-@@ -671,6 +679,16 @@ std::string Upscaling::GetProfilePreviewText(PerfProfile profile) const
+@@ -671,6 +679,17 @@ std::string Upscaling::GetProfilePreviewText(PerfProfile profile) const
  
  void Upscaling::RegisterUxActions()
  {
 +	FEATURE_COMMAND("setImageFinishing",
 +		"Set image finishing live. Params: enabled (bool), strength (0..5), afterNR (bool), originalColour (0..1), originalBrightness (0..1). Placement applies to post-upscale NR; original-scene matching applies to VR foveated LDR. Brightness preservation reduces generated shading. Omitted values are retained.",
-+		[](Feature*, const json& args) {
-+			settings.sharpnessEnabledDLSS = args.value("enabled", settings.sharpnessEnabledDLSS);
-+			settings.sharpnessDLSS = Sharpening::Sanitize(args.value("strength", settings.sharpnessDLSS));
-+			settings.sharpnessAfterNR = args.value("afterNR", settings.sharpnessAfterNR);
++		[](Feature* a_self, const json& args) {
++			auto& upscaling = *static_cast<Upscaling*>(a_self);
++			upscaling.settings.sharpnessEnabledDLSS = args.value("enabled", upscaling.settings.sharpnessEnabledDLSS);
++			upscaling.settings.sharpnessDLSS = Sharpening::Sanitize(args.value("strength", upscaling.settings.sharpnessDLSS));
++			upscaling.settings.sharpnessAfterNR = args.value("afterNR", upscaling.settings.sharpnessAfterNR);
 +			auto unit = [](float value) { return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f; };
-+			foveatedRender.settings.neuralRenderingOriginalColour = unit(args.value("originalColour", foveatedRender.settings.neuralRenderingOriginalColour));
-+			foveatedRender.settings.neuralRenderingOriginalBrightness = unit(args.value("originalBrightness", foveatedRender.settings.neuralRenderingOriginalBrightness));
++			upscaling.foveatedRender.settings.neuralRenderingOriginalColour = unit(args.value("originalColour", upscaling.foveatedRender.settings.neuralRenderingOriginalColour));
++			upscaling.foveatedRender.settings.neuralRenderingOriginalBrightness = unit(args.value("originalBrightness", upscaling.foveatedRender.settings.neuralRenderingOriginalBrightness));
 +		});
  	FEATURE_QUERY("eyeTrackingStatus",
  		"Read native OpenVR query validity/cost, last-valid-query age (not sensor age), raw/filtered gaze, resolved crops and history-reset counters. Params: none.",
  		[](const Feature*, const json&) -> json {
-@@ -856,8 +874,15 @@ void Upscaling::DrawSettings()
+@@ -856,8 +875,15 @@ void Upscaling::DrawSettings()
  									  "Off by default; DLSS already resolves a sharp image."));
  			}
  
@@ -200,7 +201,7 @@ index 77fed79..6eaba2f 100644
  
  			const char* presets[] = {
  				T(TKEY("dlss_model_preset_default"), "Default"),
-@@ -1278,6 +1303,7 @@ void Upscaling::LoadSettings(json& o_json)
+@@ -1278,6 +1304,7 @@ void Upscaling::LoadSettings(json& o_json)
  	// detect absence explicitly so a pre-existing config still runs the migration.
  	const bool hadFsr4SchemaVersion = o_json.contains("fsr4RuntimeSelectionSchemaVersion");
  	settings = o_json;
@@ -208,7 +209,7 @@ index 77fed79..6eaba2f 100644
  	if (!hadFsr4SchemaVersion)
  		settings.fsr4RuntimeSelectionSchemaVersion = 0;
  	ApplyLegacyFsr4RuntimeSelectionMigration(settings, fidelityFX.GetFsr4AdapterSupport());
-@@ -3305,9 +3331,8 @@ void Upscaling::ApplySharpening()
+@@ -3305,9 +3332,8 @@ void Upscaling::ApplySharpening()
  
  		CS_GPU_PASS("Upscaling::Sharpening");
  
@@ -220,7 +221,7 @@ index 77fed79..6eaba2f 100644
  		return;
  	}
  
-@@ -3327,14 +3352,9 @@ void Upscaling::ApplySharpening()
+@@ -3327,14 +3353,9 @@ void Upscaling::ApplySharpening()
  	context->OMSetRenderTargets(0, nullptr, nullptr);
  
  	if (settings.sharpnessEnabledDLSS && settings.sharpnessDLSS > 0.0f && main.UAV) {
@@ -237,7 +238,7 @@ index 77fed79..6eaba2f 100644
  	} else {
  		// Sharpening is disabled: resolve the DLSS output without altering it.
  		context->CopyResource(main.texture, sharpenerTexture->resource.get());
-@@ -3393,18 +3413,8 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
+@@ -3393,18 +3414,8 @@ void Upscaling::Main_PostProcessing::thunk(RE::ImageSpaceManager* a_this, uint32
  		upscaling.UpscaleDepth();
  	}
  
@@ -510,7 +511,7 @@ index 0000000..903800b
 +	}
 +}
 diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
-index 7977eaa..75d9358 100644
+index 7977eaa..03e1d1c 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
 @@ -9,6 +9,8 @@
@@ -531,7 +532,17 @@ index 7977eaa..75d9358 100644
  	neuralRenderingLocalTone,
  	neuralRenderingLocalStructure,
  	neuralRenderingSkinStructure,
-@@ -173,12 +177,20 @@ void FoveatedRender::PostPostLoad()
+@@ -120,7 +124,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+ 	neuralRenderingAdaptiveCropTransitionFrames,
+ 	neuralRenderingEyeTrackedFoveation,
+ 	neuralRenderingEyeTrackedSmoothingMs,
+-	neuralRenderingEyeTrackedQuantizationPixels);
++	neuralRenderingEyeTrackedQuantizationPixels,
++	neuralRenderingEyeTrackedCropPaddingPixels);
+ 
+ // ============================================================================
+ // Lifecycle
+@@ -173,12 +178,20 @@ void FoveatedRender::PostPostLoad()
  
  void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
  {
@@ -552,7 +563,7 @@ index 7977eaa..75d9358 100644
  	FoveatedRenderImpl::Core::ClearShaderCache();
  	NeuralRendering::Renderer::Instance().ClearShaderCache();
  	FoveatedRenderImpl::Core::ClearResources();
-@@ -298,6 +310,8 @@ void FoveatedRender::ClampSettings()
+@@ -298,6 +311,8 @@ void FoveatedRender::ClampSettings()
  			(settings.neuralRenderingModelResolution < 70 ? 70 : 100);
  	settings.neuralRenderingPreset = std::min(settings.neuralRenderingPreset, 5u);
  	settings.neuralRenderingIntensity = std::clamp(settings.neuralRenderingIntensity, 0.0f, 2.0f);
@@ -561,7 +572,15 @@ index 7977eaa..75d9358 100644
  	settings.neuralRenderingLocalTone = std::clamp(settings.neuralRenderingLocalTone, 0.0f, 2.0f);
  	settings.neuralRenderingLocalStructure = std::clamp(settings.neuralRenderingLocalStructure, 0.0f, 2.0f);
  	settings.neuralRenderingSkinStructure = std::clamp(settings.neuralRenderingSkinStructure, -1.0f, 2.0f);
-@@ -716,7 +730,7 @@ uint FoveatedRender::GetActivePresetDLSS() const
+@@ -375,6 +390,7 @@ void FoveatedRender::ClampSettings()
+ 	settings.neuralRenderingAdaptiveCropTransitionFrames = std::clamp(settings.neuralRenderingAdaptiveCropTransitionFrames, 2u, 24u);
+ 	settings.neuralRenderingEyeTrackedSmoothingMs = std::clamp(settings.neuralRenderingEyeTrackedSmoothingMs, 0.0f, 250.0f);
+ 	settings.neuralRenderingEyeTrackedQuantizationPixels = std::clamp(settings.neuralRenderingEyeTrackedQuantizationPixels, 0u, 64u);
++	settings.neuralRenderingEyeTrackedCropPaddingPixels = std::clamp(settings.neuralRenderingEyeTrackedCropPaddingPixels, 0u, 128u);
+ 	// Preset clamping reads from Upscaling::Settings now.
+ 	auto& sharedPreset = globals::features::upscaling.settings.presetDLSS;
+ 	sharedPreset = std::min(sharedPreset, 5u);
+@@ -716,7 +732,7 @@ uint FoveatedRender::GetActivePresetDLSS() const
  
  float FoveatedRender::GetActiveSharpnessDLSS() const
  {
@@ -570,7 +589,19 @@ index 7977eaa..75d9358 100644
  }
  
  float FoveatedRender::GetRenderScaleForQuality(uint qualityMode)
-@@ -1368,6 +1382,14 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1335,6 +1351,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+ 				int quantizationPixels = static_cast<int>(std::min(settings.neuralRenderingEyeTrackedQuantizationPixels, 64u));
+ 				if (ImGui::SliderInt("Crop movement quantization", &quantizationPixels, 0, 64, quantizationPixels == 0 ? "Off" : "%d input px"))
+ 					settings.neuralRenderingEyeTrackedQuantizationPixels = static_cast<uint>(std::clamp(quantizationPixels, 0, 64));
++				int cropPadding = static_cast<int>(std::min(settings.neuralRenderingEyeTrackedCropPaddingPixels, 128u));
++				if (ImGui::SliderInt("Gaze crop edge margin", &cropPadding, 0, 128, cropPadding == 0 ? "Off" : "%d input px"))
++					settings.neuralRenderingEyeTrackedCropPaddingPixels = static_cast<uint>(std::clamp(cropPadding, 0, 128));
++				if (auto _tt = Util::HoverTooltipWrapper())
++					drawWrapped("Expands the moving NR crop by this many input pixels on each edge. It can hide crop-boundary artifacts, at the cost of processing a larger area. Zero preserves the current crop size.");
+ 				if (!globals::game::isVR)
+ 					drawWarningWrapped("Native OpenVR gaze is available only in VR.");
+ 				else if (GetDlssMode() != DlssMode::kDefault)
+@@ -1368,6 +1389,14 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  			}
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
@@ -586,7 +617,7 @@ index 7977eaa..75d9358 100644
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure"), &settings.neuralRenderingSkinStructure, -1.0f, 2.0f, "%.2f");
  			custom |= ImGui::Checkbox(T(TKEY("neural_rendering_auto_mask"), "Automatic Mask"), &settings.neuralRenderingAutoMask);
 diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h
-index 89c793a..5b8ddaf 100644
+index 89c793a..454ff89 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h
 +++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.h
 @@ -112,6 +112,8 @@ struct FoveatedRender
@@ -598,6 +629,14 @@ index 89c793a..5b8ddaf 100644
  		float neuralRenderingLocalTone = 1.00f;
  		float neuralRenderingLocalStructure = 1.70f;
  		float neuralRenderingSkinStructure = -1.0f;
+@@ -172,6 +174,7 @@ struct FoveatedRender
+ 		bool neuralRenderingEyeTrackedFoveation = false;
+ 		float neuralRenderingEyeTrackedSmoothingMs = 0.0f;
+ 		uint neuralRenderingEyeTrackedQuantizationPixels = 8;
++		uint neuralRenderingEyeTrackedCropPaddingPixels = 0;
+ 	};
+ 
+ 	inline static constexpr Util::Settings::RestartTable<Settings, 1> kRestartFields{ {
 diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Core.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Core.cpp
 index e51217b..7c677b9 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Core.cpp
@@ -741,6 +780,18 @@ index 03ca298..70d425f 100644
  
  	// Hash of per-eye UVs + mode for change detection (forces SL DLSS resource
  	// recreation). Both eyes are mixed in so asymmetric presets — e.g. Nasal
+diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Params.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Params.cpp
+index 7e7a357..3588ff3 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Params.cpp
++++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Params.cpp
+@@ -64,6 +64,7 @@ namespace FoveatedRenderImpl
+ 			.enabled = enhancer.settings.neuralRenderingEyeTrackedFoveation,
+ 			.smoothingMs = enhancer.settings.neuralRenderingEyeTrackedSmoothingMs,
+ 			.quantizationPixels = enhancer.settings.neuralRenderingEyeTrackedQuantizationPixels,
++			.cropPaddingPixels = enhancer.settings.neuralRenderingEyeTrackedCropPaddingPixels,
+ 		};
+ 		const bool gazeRequested = gazeConfig.enabled && enhancer.settings.neuralRenderingEnabled &&
+ 			p.mode == FoveatedRender::DlssMode::kDefault &&
 diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.cpp
 index 535eea8..a6887ac 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender/Postprocess.cpp
@@ -894,11 +945,79 @@ index 7ccc8dc..d9d3b52 100644
 +		static void Reset();
  	};
  }
+diff --git a/runtime/open-shaders/src/Features/Upscaling/GazeCropPolicy.h b/runtime/open-shaders/src/Features/Upscaling/GazeCropPolicy.h
+index d5eb5ec..f1430d0 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/GazeCropPolicy.h
++++ b/runtime/open-shaders/src/Features/Upscaling/GazeCropPolicy.h
+@@ -7,6 +7,34 @@
+ 
+ namespace FoveatedRenderImpl::GazeCropPolicy
+ {
++	struct Region
++	{
++		float x = 0.0f;
++		float y = 0.0f;
++		float w = 1.0f;
++		float h = 1.0f;
++	};
++
++	/** Expand a normalized crop by the same pixel margin on all four sides. */
++	inline Region ExpandRegion(Region region,
++		std::uint32_t width, std::uint32_t height, std::uint32_t paddingPixels)
++	{
++		if (!width || !height || !paddingPixels)
++			return region;
++
++		const float padX = static_cast<float>(paddingPixels) / static_cast<float>(width);
++		const float padY = static_cast<float>(paddingPixels) / static_cast<float>(height);
++		const float newWidth = std::min(1.0f, region.w + 2.0f * padX);
++		const float newHeight = std::min(1.0f, region.h + 2.0f * padY);
++		const float centerX = region.x + region.w * 0.5f;
++		const float centerY = region.y + region.h * 0.5f;
++		region.w = newWidth;
++		region.h = newHeight;
++		region.x = std::clamp(centerX - newWidth * 0.5f, 0.0f, 1.0f - newWidth);
++		region.y = std::clamp(centerY - newHeight * 0.5f, 0.0f, 1.0f - newHeight);
++		return region;
++	}
++
+ 	/** Smooth fixation noise only; deliberate eye movement bypasses the filter. */
+ 	inline std::array<float, 2> Filter(const std::array<float, 2>& previous,
+ 		const std::array<float, 2>& sample, float deltaMs, float smoothingMs,
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp b/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp
-index eddbd2c..038967f 100644
+index eddbd2c..ac2a376 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.cpp
-@@ -497,9 +497,7 @@ namespace FoveatedRenderImpl::NativeOpenVRGaze
+@@ -106,7 +106,8 @@ namespace FoveatedRenderImpl::NativeOpenVRGaze
+ 		bool SameConfig(const Config& a_lhs, const Config& a_rhs)
+ 		{
+ 			return a_lhs.enabled == a_rhs.enabled && NearlyEqual(a_lhs.smoothingMs, a_rhs.smoothingMs) &&
+-				a_lhs.quantizationPixels == a_rhs.quantizationPixels;
++				a_lhs.quantizationPixels == a_rhs.quantizationPixels &&
++				a_lhs.cropPaddingPixels == a_rhs.cropPaddingPixels;
+ 		}
+ 
+ 		void ClearSampleStateLocked()
+@@ -277,8 +278,16 @@ namespace FoveatedRenderImpl::NativeOpenVRGaze
+ 			std::uint32_t a_frame,
+ 			bool a_allowDynamic)
+ 		{
+-			const auto baseLeft = SanitizeRegion(a_baseLeftUV);
+-			const auto baseRight = SanitizeRegion(a_baseRightUV);
++			auto baseLeft = SanitizeRegion(a_baseLeftUV);
++			auto baseRight = SanitizeRegion(a_baseRightUV);
++			if (a_config.enabled && a_config.cropPaddingPixels) {
++				const auto left = GazeCropPolicy::ExpandRegion(
++					{ baseLeft.x, baseLeft.y, baseLeft.w, baseLeft.h }, a_eyeWidth, a_eyeHeight, a_config.cropPaddingPixels);
++				const auto right = GazeCropPolicy::ExpandRegion(
++					{ baseRight.x, baseRight.y, baseRight.w, baseRight.h }, a_eyeWidth, a_eyeHeight, a_config.cropPaddingPixels);
++				baseLeft = { left.x, left.y, left.w, left.h };
++				baseRight = { right.x, right.y, right.w, right.h };
++			}
+ 			ResolvedCrop result{ .leftUV = baseLeft, .rightUV = baseRight };
+ 			FillDiagnosticsBase(result.diagnostics, a_config, a_frame, a_allowDynamic);
+ 
+@@ -497,9 +506,7 @@ namespace FoveatedRenderImpl::NativeOpenVRGaze
  			a_eyeWidth, a_eyeHeight, a_frame, a_allowDynamic);
  		const bool cropChanged = state.cacheValid && (a_config.enabled || state.cachedResult.diagnostics.experimentEnabled) &&
  			(!SameRegion(result.leftUV, state.cachedResult.leftUV) || !SameRegion(result.rightUV, state.cachedResult.rightUV));
@@ -909,11 +1028,31 @@ index eddbd2c..038967f 100644
  		state.cropChangeCount += cropChanged ? 1 : 0;
  		state.historyResetCount += result.historyReset ? 1 : 0;
  		result.diagnostics.cropChanged = cropChanged;
+diff --git a/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.h b/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.h
+index 677517e..739841b 100644
+--- a/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.h
++++ b/runtime/open-shaders/src/Features/Upscaling/NativeOpenVRGaze.h
+@@ -34,6 +34,7 @@ namespace FoveatedRenderImpl::NativeOpenVRGaze
+ 		bool enabled = false;
+ 		float smoothingMs = 0.0f;
+ 		std::uint32_t quantizationPixels = 8;
++		std::uint32_t cropPaddingPixels = 0;
+ 	};
+ 
+ 	struct Diagnostics
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
-index 84c9982..1d8fbba 100644
+index 84c9982..19bb486 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Integration.cpp
-@@ -627,7 +627,9 @@ namespace NeuralRendering
+@@ -562,6 +562,7 @@ namespace NeuralRendering
+ 			.enabled = foveated.settings.neuralRenderingEyeTrackedFoveation,
+ 			.smoothingMs = foveated.settings.neuralRenderingEyeTrackedSmoothingMs,
+ 			.quantizationPixels = foveated.settings.neuralRenderingEyeTrackedQuantizationPixels,
++			.cropPaddingPixels = foveated.settings.neuralRenderingEyeTrackedCropPaddingPixels,
+ 		};
+ 		const bool gazeRequested = gazeConfig.enabled && foveated.settings.neuralRenderingEnabled &&
+ 			foveated.GetDlssMode() == FoveatedRender::DlssMode::kDefault &&
+@@ -627,7 +628,9 @@ namespace NeuralRendering
  		ID3D11Resource* destination = total.texture;
  		ID3D11UnorderedAccessView* destinationUAV = total.UAV;
  		bool stagedBlendTarget = false;
@@ -924,7 +1063,7 @@ index 84c9982..1d8fbba 100644
  			// kTOTAL is not guaranteed to have D3D11_BIND_UNORDERED_ACCESS. Keep
  			// its original background in a private UAV-capable copy, blend there,
  			// then copy the finished SBS image back. This costs two full-frame
-@@ -666,6 +668,7 @@ namespace NeuralRendering
+@@ -666,6 +669,7 @@ namespace NeuralRendering
  				.sourceY = y,
  				.motionVectorScaleX = motionScaleX * guideWidth,
  				.motionVectorScaleY = motionScaleY * guideHeight,
@@ -933,7 +1072,7 @@ index 84c9982..1d8fbba 100644
  		}
  		Tuning tuning = GetTuning(foveated, true);
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
-index 5bb7255..f719a15 100644
+index 5bb7255..1ca1957 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/Renderer.cpp
 @@ -1,3 +1,4 @@
@@ -941,7 +1080,33 @@ index 5bb7255..f719a15 100644
  #include "Renderer.h"
  
  #include "D3D12Interop.h"
-@@ -770,6 +771,9 @@ namespace NeuralRendering
+@@ -77,25 +78,6 @@ namespace NeuralRendering
+ 			return tuning.multiPass == 0 ? 1 : std::min(tuning.multiPass + 1, kCascadePassCount);
+ 		}
+ 
+-		void TransitionEvaluationResources(ID3D12GraphicsCommandList* commandList,
+-			ID3D12Resource* input, ID3D12Resource* depth, ID3D12Resource* motionVectors,
+-			ID3D12Resource* output, bool entering)
+-		{
+-			D3D12_RESOURCE_BARRIER barriers[4]{};
+-			ID3D12Resource* resources[4]{ input, depth, motionVectors, output };
+-			for (std::size_t index = 0; index < std::size(barriers); ++index) {
+-				barriers[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-				barriers[index].Transition.pResource = resources[index];
+-				barriers[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+-				barriers[index].Transition.StateBefore = entering ? D3D12_RESOURCE_STATE_COMMON :
+-					(index == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+-				barriers[index].Transition.StateAfter = entering ?
+-					(index == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) :
+-					D3D12_RESOURCE_STATE_COMMON;
+-			}
+-			commandList->ResourceBarrier(static_cast<UINT>(std::size(barriers)), barriers);
+-		}
+-
+ 		bool GetTextureDesc(ID3D11Resource* resource, D3D11_TEXTURE2D_DESC& desc)
+ 		{
+ 			Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+@@ -770,6 +752,9 @@ namespace NeuralRendering
  			if (failureLatched || !device || !context || !color)
  				return false;
  			ID3D11Resource* writeback = destination ? destination : color;
@@ -951,7 +1116,7 @@ index 5bb7255..f719a15 100644
  			if (!writeback)
  				return false;
  			CS_GPU_PASS("NeuralRendering::EvaluateStereo");
-@@ -821,7 +825,19 @@ namespace NeuralRendering
+@@ -821,7 +806,19 @@ namespace NeuralRendering
  					return LatchFailure("model input downsample stereo", E_FAIL);
  				if (!CopyDepthGuide(context, input.depthSRV, eye.depth.uav11.Get(), guideWidth, guideHeight))
  					return LatchFailure("depth guide conversion", E_FAIL);
@@ -972,7 +1137,7 @@ index 5bb7255..f719a15 100644
  			}
  
  			const auto adaptivePrewarm = PrepareAdjacentPrewarmResources(device, tierIndex,
-@@ -879,9 +895,10 @@ namespace NeuralRendering
+@@ -879,9 +876,10 @@ namespace NeuralRendering
  						auto& tier = eye.tiers[tierIndex];
  						ID3D11Resource* temporalOutput = tier.reducedResolution ?
  							tier.resolved.Get() : tier.output.resource11.Get();
@@ -985,7 +1150,7 @@ index 5bb7255..f719a15 100644
  						} else {
  							context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
  								temporalOutput, 0, &outputBox);
-@@ -1142,11 +1159,12 @@ namespace NeuralRendering
+@@ -1142,11 +1140,12 @@ namespace NeuralRendering
  						colorWidth, colorHeight, guideWidth, guideHeight,
  						input.motionVectorScaleX, input.motionVectorScaleY,
  						input.sourceX, input.sourceY, tuning);
@@ -1000,7 +1165,109 @@ index 5bb7255..f719a15 100644
  				} else {
  					context->CopySubresourceRegion(writeback, 0, input.sourceX, input.sourceY, 0,
  						writebackOutput, 0, &outputBox);
-@@ -2512,14 +2530,17 @@ namespace NeuralRendering
+@@ -1688,15 +1687,71 @@ namespace NeuralRendering
+ 					return false;
+ 			}
+ 
++			// Keep shared guides and cascade textures in their D3D12 states for the
++			// entire cascade. Previously every Feature 18 call bounced all four
++			// resources through COMMON independently, adding fixed barriers and driver
++			// work to each pass even at low NR resolutions.
++			constexpr auto commonState = D3D12_RESOURCE_STATE_COMMON;
++			constexpr auto readState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++			constexpr auto writeState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++			D3D12_RESOURCE_STATES initialInputState = commonState;
++			D3D12_RESOURCE_STATES depthState = commonState;
++			D3D12_RESOURCE_STATES motionState = commonState;
++			D3D12_RESOURCE_STATES finalOutputState = commonState;
++			std::array<D3D12_RESOURCE_STATES, kCascadePassCount - 1> intermediateStates{};
++			intermediateStates.fill(commonState);
++			auto outputForPass = [&](std::uint32_t passIndex) -> ID3D12Resource* {
++				return passIndex + 1 == passCount ? finalOutput : intermediates[passIndex];
++			};
++			auto outputStateForPass = [&](std::uint32_t passIndex) -> D3D12_RESOURCE_STATES& {
++				return passIndex + 1 == passCount ? finalOutputState : intermediateStates[passIndex];
++			};
++			std::array<D3D12_RESOURCE_BARRIER, 8> barriers{};
++			UINT barrierCount = 0;
++			auto transition = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES& current,
++				D3D12_RESOURCE_STATES next) {
++				if (current == next)
++					return;
++				auto& barrier = barriers[barrierCount++];
++				barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++				barrier.Transition.pResource = resource;
++				barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++				barrier.Transition.StateBefore = current;
++				barrier.Transition.StateAfter = next;
++				current = next;
++			};
++			auto flushBarriers = [&]() {
++				if (barrierCount) {
++					commandList->ResourceBarrier(barrierCount, barriers.data());
++					barrierCount = 0;
++				}
++			};
++
++			transition(initialInput, initialInputState, readState);
++			transition(depth, depthState, readState);
++			transition(motionVectors, motionState, readState);
++			transition(outputForPass(0), outputStateForPass(0), writeState);
++			flushBarriers();
++
++			bool cascadeSucceeded = true;
+ 			for (std::uint32_t passIndex = 0; passIndex < passCount; ++passIndex) {
+ 				ID3D12Resource* input = passIndex == 0 ? initialInput : intermediates[passIndex - 1];
+-				ID3D12Resource* output = (passIndex + 1 == passCount) ? finalOutput : intermediates[passIndex];
+-				if (!input || !output || input == output)
+-					return false;
++				ID3D12Resource* output = outputForPass(passIndex);
++				if (!input || !output || input == output) {
++					cascadeSucceeded = false;
++					break;
++				}
++
++				if (passIndex > 0) {
++					// The previous output is this pass's input. Transition it to SRV and
++					// the next output to UAV together in one barrier call.
++					transition(input, intermediateStates[passIndex - 1], readState);
++					transition(output, outputStateForPass(passIndex), writeState);
++					flushBarriers();
++				}
+ 
+ 				CS_GPU_PASS_SELECT3(passIndex,
+ 					"NeuralRendering::EvaluatePass0", "NeuralRendering::EvaluatePass1", "NeuralRendering::EvaluatePass2");
+-				TransitionEvaluationResources(commandList, input, depth, motionVectors, output, true);
+ 				Feature18GuideContract guide{};
+ 				guide.colorWidth = passIndex == 0 ? firstInputWidth : outputWidth;
+ 				guide.colorHeight = passIndex == 0 ? firstInputHeight : outputHeight;
+@@ -1719,13 +1774,22 @@ namespace NeuralRendering
+ 					guide.motionWidth <= guide.colorWidth && guide.motionHeight <= guide.colorHeight;
+ 				const bool succeeded = Runtime::Instance().Execute(commandList, FeatureSlot(eyeIndex, tierIndex, passIndex),
+ 					input, depth, motionVectors, output, guide, tuning, reset);
+-				TransitionEvaluationResources(commandList, input, depth, motionVectors, output, false);
+ 				if (!succeeded) {
+ 					logger::warn("[DLSSNR] cascade pass failed eye={} pass={} of {}", eyeIndex, passIndex + 1, passCount);
+-					return false;
++					cascadeSucceeded = false;
++					break;
+ 				}
+ 			}
+-			return true;
++
++			// Return every touched shared resource to COMMON for the D3D11 side,
++			// including the partially recorded failure path.
++			transition(initialInput, initialInputState, commonState);
++			transition(depth, depthState, commonState);
++			transition(motionVectors, motionState, commonState);
++			for (std::uint32_t passIndex = 0; passIndex < passCount; ++passIndex)
++				transition(outputForPass(passIndex), outputStateForPass(passIndex), commonState);
++			flushBarriers();
++			return cascadeSucceeded;
+ 		}
+ 
+ 		struct ModelResolutionConstants
+@@ -2512,14 +2576,17 @@ namespace NeuralRendering
  		ID3D11Resource* destination, ID3D11UnorderedAccessView* destinationUAV,
  		bool blendSubrect, const StereoResourceEnvelope& resourceEnvelope)
  	{
@@ -1166,6 +1433,18 @@ index 17d2034..627317c 100644
  
  	// VR stereo DLSS: NGX D3D11 only accepts zero-offset subrects. Non-zero offsets return
  	// FAIL_InvalidParameter because Streamline's dlssEntry.cpp never sets
+diff --git a/runtime/open-shaders/src/Features/VRS.cpp b/runtime/open-shaders/src/Features/VRS.cpp
+index f95f80e..b66f18a 100644
+--- a/runtime/open-shaders/src/Features/VRS.cpp
++++ b/runtime/open-shaders/src/Features/VRS.cpp
+@@ -336,6 +336,7 @@ void VRS::UpdateVRShadingRateState()
+ 			.enabled = true,
+ 			.smoothingMs = foveated.settings.neuralRenderingEyeTrackedSmoothingMs,
+ 			.quantizationPixels = foveated.settings.neuralRenderingEyeTrackedQuantizationPixels,
++			.cropPaddingPixels = foveated.settings.neuralRenderingEyeTrackedCropPaddingPixels,
+ 		};
+ 		const auto gaze = FoveatedRenderImpl::NativeOpenVRGaze::ResolveForFrame(config, leftUV, rightUV,
+ 			frameInfo.renderWidth / 2, frameInfo.renderHeight, globals::state->frameCount,
 diff --git a/runtime/open-shaders/tests/cpp/CMakeLists.txt b/runtime/open-shaders/tests/cpp/CMakeLists.txt
 index 45d1225..36e75b1 100644
 --- a/runtime/open-shaders/tests/cpp/CMakeLists.txt
@@ -1221,6 +1500,34 @@ index 0000000..736d4a2
 +		REQUIRE(reset);
 +	}
 +}
+diff --git a/runtime/open-shaders/tests/cpp/test_gaze_crop_policy.cpp b/runtime/open-shaders/tests/cpp/test_gaze_crop_policy.cpp
+index de1e08e..f6b617f 100644
+--- a/runtime/open-shaders/tests/cpp/test_gaze_crop_policy.cpp
++++ b/runtime/open-shaders/tests/cpp/test_gaze_crop_policy.cpp
+@@ -4,6 +4,23 @@
+ 
+ using namespace FoveatedRenderImpl;
+ 
++TEST_CASE("Gaze crop margin expands all edges in input-pixel units", "[gaze]")
++{
++	const auto region = GazeCropPolicy::ExpandRegion({ 0.2f, 0.2f, 0.6f, 0.6f }, 1000, 500, 20);
++	REQUIRE(region.x == Catch::Approx(0.18f));
++	REQUIRE(region.y == Catch::Approx(0.16f));
++	REQUIRE(region.w == Catch::Approx(0.64f));
++	REQUIRE(region.h == Catch::Approx(0.68f));
++
++	const auto edge = GazeCropPolicy::ExpandRegion({ 0.0f, 0.0f, 0.6f, 0.6f }, 1000, 500, 20);
++	REQUIRE(edge.x == Catch::Approx(0.0f));
++	REQUIRE(edge.y == Catch::Approx(0.0f));
++	REQUIRE(edge.x + edge.w <= 1.0f);
++	REQUIRE(edge.y + edge.h <= 1.0f);
++	REQUIRE(GazeCropPolicy::ExpandRegion(region, 0, 500, 20).w == region.w);
++	REQUIRE(GazeCropPolicy::ExpandRegion(region, 1000, 500, 0).w == region.w);
++}
++
+ TEST_CASE("Gaze pursuit and saccades bypass saved smoothing", "[gaze]")
+ {
+ 	for (const float smoothing : { 0.0f, 20.0f, 250.0f }) {
 diff --git a/runtime/open-shaders/tests/cpp/test_sharpening_strength.cpp b/runtime/open-shaders/tests/cpp/test_sharpening_strength.cpp
 new file mode 100644
 index 0000000..a38f735
