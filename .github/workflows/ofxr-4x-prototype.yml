@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - ofxr-4x-prototype
     paths:
       - 'ofxr4x/**'
