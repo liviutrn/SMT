@@ -1,0 +1,134 @@
+name: OpenNR 2.15.1 public test build
+
+on:
+  push:
+    branches: [codex/opennr-2151-test-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout build patch
+        uses: actions/checkout@v6
+        with:
+          path: control
+          persist-credentials: false
+
+      - name: Checkout matching OpenNR 2.15.1 source
+        uses: actions/checkout@v6
+        with:
+          repository: olekspa/OpenNR
+          ref: b272d732bd22d3ae6e320e03a5f06957492b916d
+          path: source
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Apply targeted fix
+        shell: pwsh
+        run: |
+          $patch = Join-Path $PWD 'control/patches/opennr-2151-gaze-history.patch'
+          [IO.File]::WriteAllText($patch, [IO.File]::ReadAllText($patch).Replace("`r`n", "`n"), [Text.UTF8Encoding]::new($false))
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch failed to apply cleanly' }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Patch apply failed' }
+          git -C source diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patched source has whitespace errors' }
+
+      - name: Configure build for existing installation payload
+        shell: pwsh
+        run: |
+          $cmake = 'source/runtime/open-shaders/CMakeLists.txt'
+          $text = [IO.File]::ReadAllText($cmake)
+          $gate = 'add_dependencies(${PROJECT_NAME} Validate-OpenNR-Source)'
+          if (-not $text.Contains($gate)) { throw 'Expected source package gate missing' }
+          [IO.File]::WriteAllText($cmake, $text.Replace($gate, '# DLL build uses the already-installed OpenNR package inputs.'), [Text.UTF8Encoding]::new($false))
+          $runtime = 'source/runtime/open-shaders/cmake/Streamline-Runtime.cmake'
+          $text = [IO.File]::ReadAllText($runtime)
+          $start = $text.IndexOf('set(OPENNR_DLSSNR_RUNTIME_SOURCE')
+          $end = $text.IndexOf('stage_streamline_runtime(sl.common.dll', $start)
+          if ($start -lt 0 -or $end -lt 0) { throw 'Expected private carrier staging block missing' }
+          $text = $text.Substring(0, $start) + '# The existing installation supplies its private Feature 18 carrier.' + "`n" + $text.Substring($end)
+          [IO.File]::WriteAllText($runtime, $text, [Text.UTF8Encoding]::new($false))
+          git -C source diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Build setup edits failed whitespace check' }
+
+      - name: Locate preinstalled vcpkg
+        shell: pwsh
+        run: |
+          cmake --version
+          if ($env:VCPKG_INSTALLATION_ROOT -and (Test-Path "$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake")) {
+            "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } elseif (Test-Path "C:/vcpkg/scripts/buildsystems/vcpkg.cmake") {
+            "VCPKG_ROOT=C:/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            throw 'Preinstalled vcpkg not found'
+          }
+
+      - name: Configure
+        shell: pwsh
+        working-directory: source/runtime/open-shaders
+        run: cmake --preset PR -B build/PR -DBUILD_SHADER_TESTS=OFF
+
+      - name: Build replacement DLL
+        shell: pwsh
+        working-directory: source/runtime/open-shaders
+        run: cmake --build build/PR --config Release --target CommunityShaders --parallel
+
+      - name: Build and run C++ regression tests
+        shell: pwsh
+        run: |
+          cmake --build source/runtime/open-shaders/build/PR --config Release --target cpp_tests --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'C++ test build failed' }
+          $tests = Get-ChildItem source/runtime/open-shaders/build/PR -Filter cpp_tests.exe -Recurse | Select-Object -First 1
+          if (-not $tests) { throw 'cpp_tests.exe missing' }
+          & $tests.FullName --reporter compact
+          if ($LASTEXITCODE -ne 0) { throw 'C++ regression tests failed' }
+
+      - name: Compile all changed shaders
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin" -Filter fxc.exe -Recurse |
+            Where-Object { $_.FullName.Replace('\', '/').ToLowerInvariant().EndsWith('/x64/fxc.exe') } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK x64 fxc.exe not found' }
+          $shaders = @('FoveatedRender/CropMotionCS.hlsl', 'FoveatedRender/SubrectBlendCS.hlsl', 'RCAS/RCAS.hlsl')
+          foreach ($shader in $shaders) {
+            $name = [IO.Path]::GetFileNameWithoutExtension($shader)
+            & $fxc.FullName /nologo /T cs_5_0 /E main /Fo "$env:RUNNER_TEMP/$name.cso" "source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/$shader"
+            if ($LASTEXITCODE -ne 0) { throw "Shader compile failed: $shader" }
+          }
+
+      - name: Create drop-in installation
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem source/runtime/open-shaders/build/PR -Filter CommunityShaders.dll -Recurse | Select-Object -First 1
+          if (-not $dll) { throw 'CommunityShaders.dll missing' }
+          $root = 'install/Data'
+          New-Item -ItemType Directory -Force "$root/SKSE/Plugins","$root/Shaders/Upscaling/FoveatedRender","$root/Shaders/Upscaling/RCAS" | Out-Null
+          Copy-Item $dll.FullName "$root/SKSE/Plugins/CommunityShaders.dll"
+          Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl "$root/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl"
+          Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl "$root/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl"
+          Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/RCAS/RCAS.hlsl "$root/Shaders/Upscaling/RCAS/RCAS.hlsl"
+          @'
+          Install over OpenNR 2.15.1 with your mod manager, keeping its existing files.
+          Back up CommunityShaders.dll before replacing it.
+          Preserves the tested gaze fix and adds sharpening strength 0-5, Before/After NR placement, and original colour/brightness preservation.
+          Enable Sharpening, then use the placement button. Colour controls are on the Neural Rendering page.
+          Default preservation is zero (off). Brightness preservation also reduces generated shading.
+          Install the DLL and all three shaders together. Disable this overlay to restore your tested gaze build.
+          Source: olekspa/OpenNR b272d732bd22d3ae6e320e03a5f06957492b916d
+          A successful compile does not verify the visual result in a Skyrim VR headset.
+          '@ | Set-Content install/README.txt
+          Get-ChildItem install/Data -File -Recurse | ForEach-Object { $hash = Get-FileHash $_.FullName -Algorithm SHA256; "$($hash.Hash)  $($_.FullName.Substring((Resolve-Path install).Path.Length + 1))" } | Set-Content install/SHA256.txt
+
+      - name: Upload installable files
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenNR-2.15.1-Gaze-Sharpen-Colour-Test
+          path: install/
+          retention-days: 30
