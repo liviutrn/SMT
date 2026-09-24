@@ -1,4 +1,4 @@
-name: OpenNR 2.15.1 public test build
+name: OpenNR 2.15.1 alternating-eye temporal build
 
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Apply targeted fix
+      - name: Apply stereo temporal handoff
         shell: pwsh
         run: |
           $patch = Join-Path $PWD 'control/patches/opennr-2151-gaze-history.patch'
@@ -89,18 +89,27 @@ jobs:
           & $tests.FullName --reporter compact
           if ($LASTEXITCODE -ne 0) { throw 'C++ regression tests failed' }
 
-      - name: Compile all changed shaders
+      - name: Compile changed shaders
         shell: pwsh
         run: |
           $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin" -Filter fxc.exe -Recurse |
             Where-Object { $_.FullName.Replace('\', '/').ToLowerInvariant().EndsWith('/x64/fxc.exe') } |
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'Windows SDK x64 fxc.exe not found' }
-          $shaders = @('FoveatedRender/CropMotionCS.hlsl', 'FoveatedRender/SubrectBlendCS.hlsl', 'RCAS/RCAS.hlsl')
+          $shaders = @(
+            @{ Path = 'FoveatedRender/CropMotionCS.hlsl'; Entry = 'main' },
+            @{ Path = 'FoveatedRender/SubrectBlendCS.hlsl'; Entry = 'main' },
+            @{ Path = 'RCAS/RCAS.hlsl'; Entry = 'main' },
+            @{ Path = 'NeuralRendering/TemporalReuseCS.hlsl'; Entry = 'Snapshot' },
+            @{ Path = 'NeuralRendering/TemporalReuseCS.hlsl'; Entry = 'Accumulate' },
+            @{ Path = 'NeuralRendering/TemporalReuseCS.hlsl'; Entry = 'PackNativeMotion' },
+            @{ Path = 'NeuralRendering/TemporalReuseCS.hlsl'; Entry = 'Reproject' }
+          )
           foreach ($shader in $shaders) {
-            $name = [IO.Path]::GetFileNameWithoutExtension($shader)
-            & $fxc.FullName /nologo /T cs_5_0 /E main /Fo "$env:RUNNER_TEMP/$name.cso" "source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/$shader"
-            if ($LASTEXITCODE -ne 0) { throw "Shader compile failed: $shader" }
+            $name = [IO.Path]::GetFileNameWithoutExtension($shader.Path) + '-' + $shader.Entry
+            $path = "source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/$($shader.Path)"
+            & $fxc.FullName /nologo /T cs_5_0 /E $shader.Entry /Fo "$env:RUNNER_TEMP/$name.cso" $path
+            if ($LASTEXITCODE -ne 0) { throw "Shader compile failed: $($shader.Path) entry $($shader.Entry)" }
           }
 
       - name: Create drop-in installation
@@ -109,19 +118,19 @@ jobs:
           $dll = Get-ChildItem source/runtime/open-shaders/build/PR -Filter CommunityShaders.dll -Recurse | Select-Object -First 1
           if (-not $dll) { throw 'CommunityShaders.dll missing' }
           $root = 'install/Data'
-          New-Item -ItemType Directory -Force "$root/SKSE/Plugins","$root/Shaders/Upscaling/FoveatedRender","$root/Shaders/Upscaling/RCAS" | Out-Null
+          New-Item -ItemType Directory -Force "$root/SKSE/Plugins","$root/Shaders/Upscaling/FoveatedRender","$root/Shaders/Upscaling/RCAS","$root/Shaders/Upscaling/NeuralRendering" | Out-Null
           Copy-Item $dll.FullName "$root/SKSE/Plugins/CommunityShaders.dll"
           Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl "$root/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl"
           Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl "$root/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl"
           Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/RCAS/RCAS.hlsl "$root/Shaders/Upscaling/RCAS/RCAS.hlsl"
+          Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/NeuralRendering/TemporalReuseCS.hlsl "$root/Shaders/Upscaling/NeuralRendering/TemporalReuseCS.hlsl"
           @'
           Install over OpenNR 2.15.1 with your mod manager, keeping its existing files.
           Back up CommunityShaders.dll before replacing it.
-          Preserves the tested gaze fix. Adds sharpening strength 0-5, Before/After NR placement, original colour/brightness controls, gaze crop margin, and motion-compensated N2/N3/N4 reuse.
-          Enable Sharpening, then use its placement button. Colour controls are on the Neural Rendering page.
-          Temporal reuse and crop margin default off. Try N2 first; watch for ghosting on fast gaze changes. Large crop jumps force a full NR anchor.
-          A larger gaze crop margin processes more pixels. Multi-pass D3D12 barriers are reduced; compare timings in the built-in GPU/CPU profiler.
-          Install the DLL and all three shaders together. Disable this overlay to restore your tested gaze build.
+          Enable sharpening on the Neural Rendering page; the strength ranges 0-5 and the placement button selects before/after NR. Colour and brightness preservation plus the gaze crop edge margin are also available.
+          Stereo alternating-eye temporal mode defaults off. When enabled, it runs one native NR eye per frame, motion-reprojects the other eye, and accumulates two-frame motion before the next native update. It requires single-pass NR at 100% or matched-residual mode; adaptive, multi-pass, and pre-upscale NR disable it.
+          Try it first with a fixed center crop. Small gaze shifts are compensated; large jumps re-anchor both eyes. Depth changes hard-reject the old residual and color mismatch fades it near the rejection limit. Fast motion may still ghost.
+          Install the DLL and all four shaders together. Disable this overlay to restore your tested gaze build.
           Source: olekspa/OpenNR b272d732bd22d3ae6e320e03a5f06957492b916d
           A successful compile does not verify the visual result in a Skyrim VR headset.
           '@ | Set-Content install/README.txt
@@ -130,6 +139,6 @@ jobs:
       - name: Upload installable files
         uses: actions/upload-artifact@v7
         with:
-          name: OpenNR-2.15.1-Gaze-ImageFinish-TemporalPerf-Test
+          name: OpenNR-2.15.1-Gaze-AlternatingEye-Temporal-Test
           path: install/
           retention-days: 30
