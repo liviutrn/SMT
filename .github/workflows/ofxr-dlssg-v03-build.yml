@@ -33,8 +33,7 @@ jobs:
           $root = Join-Path $pkg 'OFXR_DLSSG_POC_v0.3'
           $cpp = Join-Path $root 'files/src/d3d12/dlssg_poc.cpp'
 
-          # Apply the two findings from the final static/first-compiler audit
-          # using Python so the exact LF/UTF-8 bytes are deterministic.
+          # Apply final audited corrections deterministically.
           $env:OFXR_DLSSG_CPP = $cpp
           @'
           from pathlib import Path
@@ -48,7 +47,7 @@ jobs:
           s = s.replace('copy_srv.BaseShaderRegister = 1;',
                         'copy_srv.BaseShaderRegister = 2;')
           old = '''    } __except(EXCEPTION_EXECUTE_HANDLER) {\n        if (exception_code != nullptr) *exception_code = GetExceptionCode();\n        return NVSDK_NGX_Result_FAIL_PlatformError;\n    }'''
-          new = '''    } __except(\n        (exception_code != nullptr ? (*exception_code = GetExceptionCode()) : 0,\n         EXCEPTION_EXECUTE_HANDLER)) {\n        return NVSDK_NGX_Result_FAIL_PlatformError;\n    }'''
+          new = '''    } __except(EXCEPTION_EXECUTE_HANDLER) {\n        // Do not call GetExceptionCode() here. It is an MSVC SEH intrinsic\n        // with context-sensitive restrictions and is not needed for recovery.\n        if (exception_code != nullptr) *exception_code = 0xFFFFFFFFu;\n        return NVSDK_NGX_Result_FAIL_PlatformError;\n    }'''
           if s.count(old) != 2:
               raise SystemExit(f'expected two pre-hotfix SEH handlers, found {s.count(old)}')
           s = s.replace(old, new)
@@ -57,10 +56,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'v0.3 final source hotfix failed' }
 
           $cppHash = (Get-FileHash $cpp -Algorithm SHA256).Hash.ToLowerInvariant()
-          $expectedCpp = '891c00081ecfa892038d08d3bb4435af6fbefe132a778a523f26f5fcdc1dc19f'
+          $expectedCpp = 'e1b1d0b7d59125aad3ba6a4975125ee03db439cccc6e2f448df8d5fee4887546'
           Write-Host "Final dlssg_poc.cpp SHA256: $cppHash"
           if ($cppHash -ne $expectedCpp) { throw "Corrected dlssg_poc.cpp hash mismatch: expected $expectedCpp, got $cppHash" }
-          Add-Content -Path (Join-Path $root 'AUDIT.md') -Value "`n### Final pre-build corrections`nThe Windows build maps GeneratedFrame to t2 and evaluates GetExceptionCode() in the MSVC __except filter. Final helper SHA-256: $cppHash.`n"
+          Add-Content -Path (Join-Path $root 'AUDIT.md') -Value "`n### Final pre-build corrections`nThe Windows build maps GeneratedFrame to t2 and uses a fixed nonzero SEH sentinel instead of the context-sensitive GetExceptionCode intrinsic. Final helper SHA-256: $cppHash.`n"
           py -m py_compile (Join-Path $root 'apply_dlssg_poc.py')
           if ($LASTEXITCODE -ne 0) { throw "POC patcher Python syntax check failed" }
 
