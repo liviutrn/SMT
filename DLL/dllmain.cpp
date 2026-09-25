@@ -3,6 +3,7 @@
 #include "config.h"
 #include "input.h"
 #include "memory.h"
+#include "unified_bridge.h"
 
 HMODULE g_hModule = NULL;
 std::atomic<bool> hasConsole = false;
@@ -51,6 +52,7 @@ DWORD WINAPI MainThread(LPVOID lpReserved)
 	//Sleep(10000);
 	LoadIniConfig();
 	InitMemory();
+	InitUnifiedBridge();
 	InitGui();
 	while (!isGuiInitialized) { Sleep(100); }
 	InitInput();
@@ -71,6 +73,7 @@ BOOL WINAPI DllMain(HMODULE hMod, DWORD dwReason, LPVOID lpReserved)
 		ShutdownInput();
 		do { Sleep(100); } while (keepAliveInput);
 		ShutdownMemory();
+		ShutdownUnifiedBridge();
 		ShutdownGui();
 		DetachConsole();
 		logFile.close();

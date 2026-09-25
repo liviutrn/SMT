@@ -1,5 +1,6 @@
 #include "shared.h"
 #include "input.h"
+#include "unified_bridge.h"
 #include "config.h"
 #include "gui.h"
 #include "game_data.h"
@@ -16,7 +17,90 @@ std::unordered_map<std::string, bool> currentlyPressed;
 std::set<std::string> tempPressed;
 std::unordered_map<std::string, bool> wasPressedKb;
 std::unordered_map<std::string, bool> wasPressedJoy;
+std::unordered_map<std::string, int> analogValues;
+std::unordered_map<Vehicle*, std::int32_t> clutchSelectedGear;
 std::atomic<int32_t> range = 0;
+std::atomic<float> clutchPowerFactor = 1.0f;
+std::atomic<float> clutchPedalAmount = -1.0f;
+std::atomic<float> throttlePedalAmount = -1.0f;
+std::atomic<float> idleTakeoffRequest = 0.0f;
+
+namespace {
+	std::string RemoveDirectionSuffix(const std::string& binding) {
+		if (binding.ends_with(".p") || binding.ends_with(".n")) {
+			return binding.substr(0, binding.size() - 2);
+		}
+		return binding;
+	}
+
+	bool IsAnalogBinding(const std::string& binding) {
+		return (binding.find(".a.") != std::string::npos || binding.find(".s.") != std::string::npos) &&
+			(binding.ends_with(".p") || binding.ends_with(".n"));
+	}
+
+	float GetAnalogPressedAmount(const std::string& binding, const bool clutch) {
+		if (!IsAnalogBinding(binding)) {
+			return -1.0f;
+		}
+
+		auto found = analogValues.find(RemoveDirectionSuffix(binding));
+		if (found == analogValues.end()) return -1.0f;
+		return NormalizeUnifiedPedalRaw(found->second, clutch, binding.ends_with(".p"));
+	}
+
+	float GetClutchPressedAmount() {
+		const float analog = GetAnalogPressedAmount(iniConfig["CONTROLLER"]["CLUTCH"].as<std::string>(), true);
+		if (analog >= 0.0f) return analog;
+		return (wasPressedKb["CLUTCH"] || wasPressedJoy["CLUTCH"]) ? 1.0f : 0.0f;
+	}
+
+	float CalculateClutchEngagement() {
+		if (!iniConfig["OPTIONS"]["ANALOG CLUTCH"].as<bool>()) return 1.0f;
+		const std::string binding = iniConfig["CONTROLLER"]["CLUTCH"].as<std::string>();
+		if (!IsAnalogBinding(binding)) return 1.0f;
+
+		const float released = 1.0f - GetClutchPressedAmount();
+		const float biteStart = std::clamp(iniConfig["CLUTCH"]["BITE START"].as<float>(), 0.0f, 0.99f);
+		const float biteEnd = std::clamp(iniConfig["CLUTCH"]["BITE END"].as<float>(), biteStart + 0.01f, 1.0f);
+		float engagement = std::clamp((released - biteStart) / (biteEnd - biteStart), 0.0f, 1.0f);
+		// Direct power curve: begins early and rises progressively across the
+		// entire remaining pedal travel, without the old late grab.
+		return std::pow(engagement, std::clamp(iniConfig["CLUTCH"]["CURVE"].as<float>(), 0.50f, 8.0f));
+	}
+
+	bool IsClutchPressedForShift() {
+		if (!iniConfig["OPTIONS"]["ANALOG CLUTCH"].as<bool>()) {
+			return wasPressedKb["CLUTCH"] || wasPressedJoy["CLUTCH"];
+		}
+		return GetClutchPressedAmount() >= 0.75f;
+	}
+
+	void UpdateClutchGearState(Vehicle* veh, float engagement) {
+		if (!iniConfig["OPTIONS"]["ANALOG CLUTCH"].as<bool>()) {
+			auto saved = clutchSelectedGear.find(veh);
+			if (saved != clutchSelectedGear.end() && veh->TruckAction->Gear_1 == 0 && saved->second != 0) {
+				veh->ShiftClutchGear(saved->second);
+			}
+			clutchSelectedGear.erase(veh);
+			return;
+		}
+
+		// A fully pressed pedal is a real drivetrain disconnect: keep the game's
+		// transmission in Neutral while remembering SMT's selected gear.
+		if (engagement <= 0.001f) {
+			if (veh->TruckAction->Gear_1 != 0) {
+				clutchSelectedGear[veh] = veh->TruckAction->Gear_1;
+				veh->ShiftClutchGear(0);
+			}
+			return;
+		}
+
+		auto saved = clutchSelectedGear.find(veh);
+		if (saved != clutchSelectedGear.end() && veh->TruckAction->Gear_1 == 0 && saved->second != 0) {
+			veh->ShiftClutchGear(saved->second);
+		}
+	}
+}
 
 std::unordered_map<std::string, std::function<void()>> bindFunctions = {
 	{ "GEAR 1",[]() { if (auto veh = GetCurrentVehicle()) { IsInAuto[veh] = true; veh->ShiftToGear(1); } }},
@@ -40,6 +124,7 @@ std::unordered_map<std::string, std::function<void()>> bindFunctions = {
 	{ "GEAR UP",[]() { if (auto veh = GetCurrentVehicle()) veh->ShiftToNextGear(); }},
 	{ "GEAR DOWN",[]() { if (auto veh = GetCurrentVehicle()) veh->ShiftToPrevGear(); }},
 	{ "CLUTCH",[]() { return; } },
+	{ "THROTTLE PEDAL",[]() { return; } },
 	{ "RANGE HIGH",[]() { if (range < 1) range++; }},
 	{ "RANGE LOW",[]() { if (range > -1) range--; }},
 	{ "SHOW MENU",[]() {showGui = !showGui; } }
@@ -92,8 +177,10 @@ namespace SMT {
 	}
 
 	bool JoyStickListener::axisMoved(const OIS::JoyStickEvent& e, int axis) {
+		const std::string base = abbreviate(e.device->vendor()) + ".a." + std::to_string(axis);
+		analogValues[base] = e.state.mAxes[axis].abs;
 		if (e.state.mAxes[axis].abs > 20000) {
-			std::string entry = abbreviate(e.device->vendor()) + ".a." + std::to_string(axis) + ".p";
+			std::string entry = base + ".p";
 			if (!currentlyPressed[entry]) {
 				tempPressed.emplace(entry);
 			}
@@ -116,6 +203,10 @@ namespace SMT {
 	}
 
 	bool JoyStickListener::sliderMoved(const OIS::JoyStickEvent& e, int sliderID) {
+		const std::string baseX = abbreviate(e.device->vendor()) + ".s.x." + std::to_string(sliderID);
+		const std::string baseY = abbreviate(e.device->vendor()) + ".s.y." + std::to_string(sliderID);
+		analogValues[baseX] = e.state.mSliders[sliderID].abX;
+		analogValues[baseY] = e.state.mSliders[sliderID].abY;
 		if (e.state.mSliders[sliderID].abX > 20000) {
 			std::string entry = abbreviate(e.device->vendor()) + ".s.x." + std::to_string(sliderID) + ".p";
 			if (!currentlyPressed[entry]) {
@@ -243,6 +334,9 @@ DWORD WINAPI ProcessInput(LPVOID lpReserved) {
 				}
 			}
 			mouse->capture();
+			clutchPedalAmount = GetClutchPressedAmount();
+			throttlePedalAmount = GetAnalogPressedAmount(
+				iniConfig["CONTROLLER"]["THROTTLE PEDAL"].as<std::string>(), false);
 			bool goToNeutral = iniConfig["OPTIONS"]["REQUIRE GEAR HELD"].as<bool>();
 			for (auto action : iniConfig["KEYBOARD"]) {
 				bool pressed = true;
@@ -330,9 +424,12 @@ DWORD WINAPI ProcessInput(LPVOID lpReserved) {
 			}
 			for (auto fnc : functionsToRun) {
 				bindFunctions[fnc]();
+				if (fnc == "GEAR N") {
+					if (auto veh = GetCurrentVehicle()) clutchSelectedGear.erase(veh);
+				}
 				if (iniConfig["OPTIONS"]["REQUIRE CLUTCH"].as<bool>()) {
 					if (auto veh = GetCurrentVehicle()) {
-						if (!wasPressedKb["CLUTCH"] && !wasPressedJoy["CLUTCH"]) {
+						if (!IsClutchPressedForShift()) {
 							if (fnc.starts_with("GEAR") && fnc != "GEAR N") {
 								veh->StallCounter = 5;
 							}
@@ -344,8 +441,23 @@ DWORD WINAPI ProcessInput(LPVOID lpReserved) {
 				if (goToNeutral && veh->TruckAction->Gear_1 != 0) {
 					bindFunctions["GEAR N"]();
 				}
+
+				const float previousFactor = clutchPowerFactor.load();
+				const float engagement = CalculateClutchEngagement();
+				const bool factorChanged = std::abs(previousFactor - engagement) >= 0.01f;
+				if (veh->TruckAction->Gear_1 == 0 || factorChanged) {
+					clutchPowerFactor = engagement;
+				}
+
+				UpdateClutchGearState(veh, engagement);
+
+				if (veh->TruckAction->Gear_1 != 0 && factorChanged) {
+					veh->RefreshPowerCoef();
+				}
+
 			}
 		}
+		UpdateUnifiedBridge(GetCurrentVehicle());
 
 		if (GetAsyncKeyState(VK_END) & 0x8000 && GetAsyncKeyState(VK_LCONTROL) & 0x8000 && GetAsyncKeyState(VK_LSHIFT) & 0x8000) {
 			DetachDLL();

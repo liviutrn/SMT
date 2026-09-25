@@ -5,6 +5,7 @@ inline const float PowerCoefLowGear = .45f;
 inline const float PowerCoefLowPlusGear = 1.f;
 inline const float PowerCoefLowMinusGear = .2f;
 
+
 class String {
 public:
 	union {
@@ -69,6 +70,8 @@ public:
 	std::uint32_t q_VehStateFlags;    // 0x0768 -- OFFSET NOT UPDATED
 	char pad_076C[244];               // 0x076C -- NOT UPDATED
 	void SetPowerCoef(float coef);
+	void RefreshPowerCoef();
+	bool ShiftClutchGear(std::int32_t targetGear);
 
 	std::int32_t GetMaxGear() const;
 

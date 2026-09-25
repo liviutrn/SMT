@@ -52,6 +52,7 @@ ini::IniFile WriteDefaultIniConfig() {
 	defaultIniConfig["CONTROLLER"]["GEAR UP"] = "NONE";
 	defaultIniConfig["CONTROLLER"]["GEAR DOWN"] = "NONE";
 	defaultIniConfig["CONTROLLER"]["CLUTCH"] = "NONE";
+	defaultIniConfig["CONTROLLER"]["THROTTLE PEDAL"] = "NONE";
 	defaultIniConfig["CONTROLLER"]["RANGE HIGH"] = "NONE";
 	defaultIniConfig["CONTROLLER"]["RANGE LOW"] = "NONE";
 	defaultIniConfig["CONTROLLER"]["SHOW MENU"] = "NONE";
@@ -61,6 +62,15 @@ ini::IniFile WriteDefaultIniConfig() {
 	defaultIniConfig["OPTIONS"]["REQUIRE CLUTCH"] = false;
 	defaultIniConfig["OPTIONS"]["IMMERSIVE MODE"] = false;
 	defaultIniConfig["OPTIONS"]["REQUIRE GEAR HELD"] = false;
+	defaultIniConfig["OPTIONS"]["ANALOG CLUTCH"] = false;
+	defaultIniConfig["OPTIONS"]["PEDAL IDLE TAKEOFF"] = false;
+
+	// Pedal travel is expressed from 0 (fully pressed) to 1 (fully released).
+	defaultIniConfig["CLUTCH"]["MODEL VERSION"] = 2;
+	defaultIniConfig["CLUTCH"]["BITE START"] = 0.10f;
+	defaultIniConfig["CLUTCH"]["BITE END"] = 0.95f;
+	defaultIniConfig["CLUTCH"]["CURVE"] = 6.00f;
+	defaultIniConfig["CLUTCH"]["IDLE THROTTLE"] = 0.25f;
 
 	return defaultIniConfig;
 }
@@ -70,10 +80,21 @@ void LoadIniConfig() {
 	std::ifstream is(configFilename);
 	if (is.is_open()) {
 		ini::IniFile tempConfig(configFilename);
+		bool hasClutchModelVersion = false;
 		for (auto category : tempConfig) {
 			for (auto entry : tempConfig[category.first]) {
+				if (category.first == "CLUTCH" && entry.first == "MODEL VERSION") hasClutchModelVersion = true;
+				// Retire the unsafe keyboard-pulse prototype even if it exists in an old ini.
+				if (category.first == "OPTIONS" && entry.first == "IDLE TAKEOFF") continue;
 				iniConfig[category.first][entry.first] = tempConfig[category.first][entry.first];
 			}
+		}
+		if (!hasClutchModelVersion) {
+			iniConfig["CLUTCH"]["MODEL VERSION"] = 2;
+			iniConfig["CLUTCH"]["BITE START"] = 0.10f;
+			iniConfig["CLUTCH"]["BITE END"] = 0.95f;
+			iniConfig["CLUTCH"]["CURVE"] = 6.00f;
+			iniConfig["CLUTCH"]["IDLE THROTTLE"] = 0.25f;
 		}
 		LogMessage("Ini config found.");
 	}
