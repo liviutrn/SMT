@@ -7,6 +7,7 @@ on:
     paths:
       - 'ofxr4x/ofxr4x_patch.py'
       - 'ofxr4x/ofxr4x_audit_fixes.py'
+      - 'ofxr4x/ofxr4x_nvidia_resources.py'
       - '.github/workflows/ofxr-4x-test2.yml'
 
 permissions:
@@ -35,6 +36,7 @@ jobs:
           python ofxr4x/ofxr4x_patch.py ofxr-src
           python -c "from pathlib import Path; p=Path('ofxr-src/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s and d not in s; p.write_text(s.replace(m,d+m,1),encoding='utf-8')"
           python ofxr4x/ofxr4x_audit_fixes.py ofxr-src
+          python ofxr4x/ofxr4x_nvidia_resources.py ofxr-src
           cd ofxr-src
           git diff --check
           git diff > ../OFXR-4X-TEST2.patch
@@ -83,6 +85,7 @@ jobs:
           - D3D11 publishes current + all three synthetic outputs in one synchronized batch.
           - Private-swapchain image-count mismatch cleans up all already-created resources.
           - Four-frame presenter enqueue is allocation-transactional; OOM cannot leave a partial sequence.
+          - Two extra synthetic swapchains are allocated only for the NVIDIA 4x path.
 
           TEST BUILD. Keep a known-working OFXR package available for rollback.
           "@ | Set-Content -Encoding UTF8 (Join-Path $root 'README-TEST2.txt')
