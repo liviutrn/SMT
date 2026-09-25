@@ -1,0 +1,99 @@
+name: OFXR 4x TEST2 audited
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ofxr4x/ofxr4x_patch.py'
+      - 'ofxr4x/ofxr4x_audit_fixes.py'
+      - '.github/workflows/ofxr-4x-test2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone pinned OFXR
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src
+          cd ofxr-src
+          git checkout dad56acafc6e1dde219940427738b926cf2ea555
+      - name: Apply 4x prototype and audit fixes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          python -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_patch.py ofxr-src
+          python -c "from pathlib import Path; p=Path('ofxr-src/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s and d not in s; p.write_text(s.replace(m,d+m,1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_audit_fixes.py ofxr-src
+          cd ofxr-src
+          git diff --check
+          git diff > ../OFXR-4X-TEST2.patch
+      - name: Build FidelityFX dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          git clone --branch v1.1.4 --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/FidelityFX-SDK-v1.1.4
+          cmake -S external/FidelityFX-SDK-v1.1.4/sdk -B build-fidelityfx -G "Visual Studio 18 2026" -A x64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          cmake --build build-fidelityfx --config Release --parallel 4
+      - name: Configure and compile TEST2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DXRFG_BUILD_TESTS=OFF
+          cmake --build build --config Release --parallel 4
+      - name: Package TEST2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root = Join-Path $PWD 'package\OFXR-Bridge-4X-TEST2'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item 'ofxr-src\build\Release\OFXRBridgeTray.exe' $root
+          Copy-Item 'ofxr-src\build\Release\ofxr' $root -Recurse
+          Copy-Item 'OFXR-4X-TEST2.patch' $root
+          $ini = Join-Path $root 'ofxr\ofxr_bridge.ini'
+          $text = Get-Content $ini -Raw
+          $text = $text -replace 'backend=fidelityfx','backend=nvidia'
+          $text = $text -replace 'nvidia_preset=fast','nvidia_preset=medium'
+          $text = $text -replace 'nvidia_input_scale=100','nvidia_input_scale=50'
+          $text = $text -replace 'nvidia_bidirectional=1','nvidia_bidirectional=0'
+          Set-Content -Encoding UTF8 $ini $text
+          @"
+          OFXR Bridge 4x TEST2 - audited build
+          Base: tig3rmast3r/OFXR-Bridge dad56acafc6e1dde219940427738b926cf2ea555
+
+          4x behavior: one NVIDIA OFA A/B calculation, then synthetic alpha 0.25, 0.50, 0.75, then real B.
+          Default test config: NVIDIA Medium, 50% OFA scale, unidirectional, motion vectors off.
+
+          Audit fixes over TEST1:
+          - Virtual 4x cadence uses the presenter's stable physical display period when available.
+          - D3D11 publishes current + all three synthetic outputs in one synchronized batch.
+          - Private-swapchain image-count mismatch cleans up all already-created resources.
+          - Four-frame presenter enqueue is allocation-transactional; OOM cannot leave a partial sequence.
+
+          TEST BUILD. Keep a known-working OFXR package available for rollback.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $root 'README-TEST2.txt')
+          Compress-Archive -Path "$root\*" -DestinationPath 'OFXR-Bridge-4X-TEST2.zip' -Force
+          Get-FileHash 'OFXR-Bridge-4X-TEST2.zip' -Algorithm SHA256 | Format-List
+      - name: Upload TEST2
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-Bridge-4X-TEST2
+          path: |
+            OFXR-Bridge-4X-TEST2.zip
+            OFXR-4X-TEST2.patch
+          if-no-files-found: error
+          retention-days: 14
