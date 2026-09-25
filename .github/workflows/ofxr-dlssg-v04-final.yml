@@ -29,7 +29,6 @@ jobs:
           [IO.File]::WriteAllBytes($zip,[Convert]::FromBase64String($b64))
           $hash=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           $expected='784cbc1091627f0df6d5cc52ccd5e30a214b741820028c08fdce2754f00ee0dc'
-          Write-Host "Reconstructed v0.4 SHA256=$hash"
           if($hash -ne $expected){throw "v0.4 package hash mismatch: expected $expected got $hash"}
           $pkg=Join-Path $env:RUNNER_TEMP 'v04pkg'
           Expand-Archive $zip $pkg -Force
@@ -65,19 +64,19 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $PSNativeCommandUseErrorActionPreference=$true
-          # This build intentionally composes DLSS-G after the pinned audited MFG transport.
-          # Disable only the generic clean-tree guard; all exact replacement assertions remain active.
           py -c "from pathlib import Path; p=Path(r'$env:V04_ROOT/apply_dlssg_poc.py'); s=p.read_text(encoding='utf-8'); old='    if dirty:\n'; assert s.count(old)==1; p.write_text(s.replace(old,'    if False and dirty:\n',1),encoding='utf-8')"
           py "$env:V04_ROOT/apply_dlssg_poc.py" (Resolve-Path 'ofxr').Path
           py "$env:V04_ROOT/mfg_transport_patch.py" (Resolve-Path 'ofxr').Path
           py "$env:V04_ROOT/dlssg_mfg_quad_patch.py" (Resolve-Path 'ofxr').Path
+          # The inherited 4x transport paces every NVIDIA session at 4x. Make it dynamic.
+          py -c "from pathlib import Path; p=Path('ofxr/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); old='state && state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia ? 4U : 2U'; new='state && state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia && xrfg::DlssgPoc::requested() ? xrfg::DlssgPoc::configured_multiplier() : 2U'; assert s.count(old)==1; p.write_text(s.replace(old,new,1),encoding='utf-8',newline='\n')"
           git -C ofxr diff --check
           if($LASTEXITCODE -ne 0){throw 'Patched source failed git diff --check'}
           $cpp=Get-Content 'ofxr/src/d3d12/d3d12_frame_synthesizer.cpp' -Raw
           $layer=Get-Content 'ofxr/src/layer/openxr_layer.cpp' -Raw
           $pocsrc=Get-Content 'ofxr/src/d3d12/dlssg_poc.cpp' -Raw
           foreach($needle in @('record_nvidia_quad','configured_multiplier','mfg_index')){if(($cpp+$pocsrc) -notmatch $needle){throw "Missing v0.4 marker: $needle"}}
-          foreach($needle in @('enqueue_presenter_quad','additional_synthetic','synthetic_count')){if($layer -notmatch $needle){throw "Missing MFG transport marker: $needle"}}
+          foreach($needle in @('enqueue_presenter_quad','additional_synthetic','synthetic_count','configured_multiplier() : 2U')){if($layer -notmatch [regex]::Escape($needle)){throw "Missing MFG transport/pacing marker: $needle"}}
           git -C ofxr diff --stat
 
       - name: Build Release x64
@@ -115,6 +114,7 @@ jobs:
           OFXR base: dad56acafc6e1dde219940427738b926cf2ea555
           Enable: OFXR_DLSSG_POC=1
           MFG: OFXR_DLSSG_MFG=2, 3 or 4
+          Pacing: dynamic, tied to OFXR_DLSSG_MFG
           "@ | Set-Content -Encoding UTF8 (Join-Path $dist 'BUILD-INFO.txt')
           Compress-Archive -Path "$dist/*" -DestinationPath 'OFXR_DLSSG_POC_v0.4_COMPILED.zip' -Force
           Get-FileHash 'OFXR_DLSSG_POC_v0.4_COMPILED.zip' -Algorithm SHA256
