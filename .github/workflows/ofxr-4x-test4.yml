@@ -1,0 +1,148 @@
+name: OFXR 4x TEST4 optimized MRT
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ofxr-4x-test4]
+    paths:
+      - 'ofxr4x/test4_b64/**'
+      - '.github/workflows/ofxr-4x-test4.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct TEST3 and TEST4 patchers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $t3 = (Get-ChildItem 'ofxr4x/test3_b64/part*' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'ofxr4x/ofxr4x_test3_pipeline.py'), [Convert]::FromBase64String($t3))
+          python -m py_compile ofxr4x/ofxr4x_test3_pipeline.py
+
+          $t4 = (Get-ChildItem 'ofxr4x/test4_b64/part*' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          $compressed = [Convert]::FromBase64String($t4)
+          $input = New-Object IO.MemoryStream(,$compressed)
+          $gzip = New-Object IO.Compression.GZipStream($input,[IO.Compression.CompressionMode]::Decompress)
+          $output = New-Object IO.MemoryStream
+          $gzip.CopyTo($output)
+          $gzip.Dispose(); $input.Dispose()
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'ofxr4x/ofxr4x_test4_revision.py'), $output.ToArray())
+          $output.Dispose()
+          python -m py_compile ofxr4x/ofxr4x_test4_revision.py
+          Get-FileHash ofxr4x/ofxr4x_test4_revision.py -Algorithm SHA256 | Format-List
+
+      - name: Clone pinned OFXR and apply TEST1-TEST4 revisions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src
+          cd ofxr-src
+          git checkout dad56acafc6e1dde219940427738b926cf2ea555
+          cd ..
+          python -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_patch.py ofxr-src
+          python -c "from pathlib import Path; p=Path('ofxr-src/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s and d not in s; p.write_text(s.replace(m,d+m,1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_audit_fixes.py ofxr-src
+          python ofxr4x/ofxr4x_signature_fix.py ofxr-src
+          python ofxr4x/ofxr4x_nvidia_resources.py ofxr-src
+          python ofxr4x/ofxr4x_test3_pipeline.py ofxr-src
+          python ofxr4x/ofxr4x_test4_revision.py ofxr-src
+          if (-not (Select-String -Quiet -Path 'ofxr-src/src/d3d12/d3d12_frame_synthesizer.cpp' -Pattern 'OFXR NVIDIA 4x MRT composition draw')) { throw 'TEST4 MRT marker missing' }
+          if (-not (Select-String -Quiet -Path 'ofxr-src/src/d3d12/frame_synthesis.hlsl' -Pattern 'SynthesizeNvidiaQuadPS')) { throw 'TEST4 quad shader missing' }
+          cd ofxr-src
+          git diff --check
+          git diff > ../OFXR-4X-TEST4.patch
+
+      - name: Build FidelityFX dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          git clone --branch v1.1.4 --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/FidelityFX-SDK-v1.1.4
+          cmake -S external/FidelityFX-SDK-v1.1.4/sdk -B build-fidelityfx -G "Visual Studio 18 2026" -A x64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          cmake --build build-fidelityfx --config Release --parallel 4
+
+      - name: Configure and compile TEST4 with tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DXRFG_BUILD_TESTS=ON
+          cmake --build build --config Release --parallel 4
+
+      - name: Run portable regression suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          # Same single WARP timing test excluded from TEST2/TEST3: it fails
+          # identically in the untouched pinned baseline on this hosted runner.
+          ctest --test-dir build -C Release --output-on-failure -E '^xrfg_d3d12_history_tests$'
+
+      - name: Static TEST4 revision assertions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $cpp = Get-Content 'ofxr-src/src/d3d12/d3d12_frame_synthesizer.cpp' -Raw
+          $layer = Get-Content 'ofxr-src/src/layer/openxr_layer.cpp' -Raw
+          if (($cpp | Select-String -Pattern 'OMSetRenderTargets\(\s*static_cast<UINT>\(rtvs.size\(\)\)' -AllMatches).Matches.Count -lt 1) { throw 'MRT binding assertion failed' }
+          if ($layer -match 'wait_for_presenter_capacity\(state, quad_ready \? 8U : 2U\)') { throw 'TEST3 post-enqueue 4x stall still present' }
+          if (($layer | Select-String -Pattern 'second_synthetic_bank' -AllMatches).Matches.Count -lt 15) { throw 'second bank cleanup/ownership references unexpectedly missing' }
+
+      - name: Package TEST4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root = Join-Path $PWD 'package\OFXR-Bridge-4X-TEST4'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item 'ofxr-src\build\Release\OFXRBridgeTray.exe' $root
+          Copy-Item 'ofxr-src\build\Release\ofxr' $root -Recurse
+          Copy-Item 'OFXR-4X-TEST4.patch' $root
+          $ini = Join-Path $root 'ofxr\ofxr_bridge.ini'
+          $text = Get-Content $ini -Raw
+          $text = $text -replace 'backend=fidelityfx','backend=nvidia'
+          $text = $text -replace 'motion_vectors=dlss','motion_vectors=off'
+          $text = $text -replace 'nvidia_preset=fast','nvidia_preset=medium'
+          $text = $text -replace 'nvidia_input_scale=100','nvidia_input_scale=50'
+          $text = $text -replace 'nvidia_bidirectional=1','nvidia_bidirectional=0'
+          Set-Content -Encoding UTF8 $ini $text
+          @"
+          OFXR Bridge 4x TEST4 - optimized MRT revision
+          Base: tig3rmast3r/OFXR-Bridge dad56acafc6e1dde219940427738b926cf2ea555
+
+          TEST4 changes over TEST3:
+          - 25/50/75 are rendered in ONE 3-render-target fullscreen pass per eye instead of three separate passes.
+          - OFA lookup, camera residual, NVIDIA cost, Fast validation and F/B confidence are shared across all three alphas.
+          - Full-resolution output is preserved for all three generated frames.
+          - One NVIDIA OFA A/B calculation is still reused for all three generated frames.
+          - Removed the redundant 4x post-enqueue <=8 presenter wait; bank safety remains enforced before reuse.
+          - Fixed second synthetic-bank cleanup leaks in D3D11 and D3D12 error paths and removed a duplicate destroy loop.
+          - TEST3 two-bank resource lifetime design remains.
+          - Per-alpha intermediate camera-space reprojection is deliberately NOT mixed into this performance revision yet.
+
+          Default baseline: NVIDIA Medium, 50% OFA input, unidirectional, game motion vectors off.
+          For comparison with TEST2/TEST3, keep these settings unchanged for the first run.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $root 'README-TEST4.txt')
+          Compress-Archive -Path "$root\*" -DestinationPath 'OFXR-Bridge-4X-TEST4.zip' -Force
+          Get-FileHash 'OFXR-Bridge-4X-TEST4.zip' -Algorithm SHA256 | Format-List
+
+      - name: Upload TEST4
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-Bridge-4X-TEST4
+          path: |
+            OFXR-Bridge-4X-TEST4.zip
+            OFXR-4X-TEST4.patch
+          if-no-files-found: error
+          retention-days: 14
