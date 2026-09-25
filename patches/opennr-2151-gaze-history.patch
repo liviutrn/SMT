@@ -812,10 +812,10 @@ index 0000000..8842332
 +	}
 +}
 diff --git a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
-index 7977eaa..9dd6327 100644
+index 7977eaa..cc31e8b 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/FoveatedRender.cpp
-@@ -9,7 +9,10 @@
+@@ -9,8 +9,12 @@
  #include "../Upscaling.h"
  #include "../VR.h"
  #include "FoveatedRender/Core.h"
@@ -824,9 +824,11 @@ index 7977eaa..9dd6327 100644
  #include "NativeOpenVRGaze.h"
 +#include "NeuralRendering/AdaptiveQualityOrder.h"
  #include "NeuralRendering/Integration.h"
++#include "NeuralRendering/StageSplitPolicy.h"
  #include "NeuralRendering/FuturePipeline.h"
  #include "NeuralRendering/Renderer.h"
-@@ -89,6 +92,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+ 
+@@ -89,6 +93,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
  	neuralRenderingModelResolution,
  	neuralRenderingPreset,
  	neuralRenderingIntensity,
@@ -835,7 +837,7 @@ index 7977eaa..9dd6327 100644
  	neuralRenderingLocalTone,
  	neuralRenderingLocalStructure,
  	neuralRenderingSkinStructure,
-@@ -96,8 +101,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+@@ -96,8 +102,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
  	neuralRenderingAutoMask,
  	neuralRenderingUICorrection,
  	neuralRenderingPreUpscale,
@@ -848,7 +850,7 @@ index 7977eaa..9dd6327 100644
  	neuralRenderingTemporalReuseCadence,
  	neuralRenderingTemporalDepthThreshold,
  	neuralRenderingTemporalColorTolerance,
-@@ -111,6 +120,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+@@ -111,6 +121,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
  	neuralRenderingAdaptiveMinimumDwellFrames,
  	neuralRenderingAdaptiveGuardTimeMs,
  	neuralRenderingAdaptiveDiagnostics,
@@ -856,7 +858,7 @@ index 7977eaa..9dd6327 100644
  	neuralRenderingAdaptiveCropEnabled,
  	neuralRenderingAdaptiveCropMaximumCoverage,
  	neuralRenderingAdaptiveCropMinimumCoverage,
-@@ -120,7 +130,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+@@ -120,7 +131,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
  	neuralRenderingAdaptiveCropTransitionFrames,
  	neuralRenderingEyeTrackedFoveation,
  	neuralRenderingEyeTrackedSmoothingMs,
@@ -873,7 +875,7 @@ index 7977eaa..9dd6327 100644
  
  // ============================================================================
  // Lifecycle
-@@ -131,6 +149,7 @@ void FoveatedRender::PostPostLoad()
+@@ -131,6 +150,7 @@ void FoveatedRender::PostPostLoad()
  	bootSnapshot.LatchIfNeeded(settings);
  	adaptiveController.Reset();
  	adaptiveCropController.Reset();
@@ -881,7 +883,7 @@ index 7977eaa..9dd6327 100644
  
  	// Opt into the stereo extension so the controller tracks a separate
  	// right-eye UV (HMD nose-side overlap symmetry).
-@@ -173,12 +192,20 @@ void FoveatedRender::PostPostLoad()
+@@ -173,12 +193,20 @@ void FoveatedRender::PostPostLoad()
  
  void FoveatedRender::UICompositeRenderHook::thunk(void* imageSpaceShader, RE::BSTriShape* shape, RE::ImageSpaceEffectParam* param)
  {
@@ -902,7 +904,7 @@ index 7977eaa..9dd6327 100644
  	FoveatedRenderImpl::Core::ClearShaderCache();
  	NeuralRendering::Renderer::Instance().ClearShaderCache();
  	FoveatedRenderImpl::Core::ClearResources();
-@@ -293,22 +320,40 @@ void FoveatedRender::ClampSettings()
+@@ -293,22 +321,40 @@ void FoveatedRender::ClampSettings()
  		settings.neuralRenderingModelResolution != 85 &&
  		settings.neuralRenderingModelResolution != 90 &&
  		settings.neuralRenderingModelResolution != 95 &&
@@ -949,7 +951,7 @@ index 7977eaa..9dd6327 100644
  		settings.neuralRenderingTemporalReuseCadence = 0;
  	settings.neuralRenderingTemporalDepthThreshold = std::clamp(settings.neuralRenderingTemporalDepthThreshold, 0.0f, 0.25f);
  	settings.neuralRenderingTemporalColorTolerance = std::clamp(settings.neuralRenderingTemporalColorTolerance, 0.0f, 0.50f);
-@@ -342,6 +387,12 @@ void FoveatedRender::ClampSettings()
+@@ -342,6 +388,12 @@ void FoveatedRender::ClampSettings()
  	settings.neuralRenderingAdaptiveMinimumDwellFrames = std::clamp(settings.neuralRenderingAdaptiveMinimumDwellFrames, 4u, 240u);
  	settings.neuralRenderingAdaptiveGuardTimeMs = std::clamp(settings.neuralRenderingAdaptiveGuardTimeMs, 0.0f, 5.0f);
  	switch (settings.neuralRenderingAdaptiveCropMinimumCoverage) {
@@ -962,7 +964,7 @@ index 7977eaa..9dd6327 100644
  	case 60:
  	case 65:
  	case 70:
-@@ -349,10 +400,16 @@ void FoveatedRender::ClampSettings()
+@@ -349,10 +401,16 @@ void FoveatedRender::ClampSettings()
  	case 80:
  		break;
  	default:
@@ -980,7 +982,7 @@ index 7977eaa..9dd6327 100644
  	case 60:
  	case 65:
  	case 70:
-@@ -373,8 +430,23 @@ void FoveatedRender::ClampSettings()
+@@ -373,8 +431,23 @@ void FoveatedRender::ClampSettings()
  	settings.neuralRenderingAdaptiveCropUpshiftFrames = std::clamp(settings.neuralRenderingAdaptiveCropUpshiftFrames, 8u, 240u);
  	settings.neuralRenderingAdaptiveCropMinimumDwellFrames = std::clamp(settings.neuralRenderingAdaptiveCropMinimumDwellFrames, 8u, 600u);
  	settings.neuralRenderingAdaptiveCropTransitionFrames = std::clamp(settings.neuralRenderingAdaptiveCropTransitionFrames, 2u, 24u);
@@ -1005,7 +1007,7 @@ index 7977eaa..9dd6327 100644
  	// Preset clamping reads from Upscaling::Settings now.
  	auto& sharedPreset = globals::features::upscaling.settings.presetDLSS;
  	sharedPreset = std::min(sharedPreset, 5u);
-@@ -424,7 +496,7 @@ void FoveatedRender::ResetAdaptiveState()
+@@ -424,7 +497,7 @@ void FoveatedRender::ResetAdaptiveState()
  	const bool cropWasActive = adaptiveCropController.IsRuntimeActive();
  	adaptiveController.Reset();
  	adaptiveCropController.Reset();
@@ -1014,7 +1016,7 @@ index 7977eaa..9dd6327 100644
  	adaptiveCropDiagnosticGeneration = UINT64_MAX;
  	if (cropWasActive)
  		FoveatedRenderImpl::Core::ResetAdaptiveCropHandoff();
-@@ -432,9 +504,8 @@ void FoveatedRender::ResetAdaptiveState()
+@@ -432,9 +505,8 @@ void FoveatedRender::ResetAdaptiveState()
  
  bool FoveatedRender::IsEyeTrackedFoveationEnabled() const
  {
@@ -1026,7 +1028,7 @@ index 7977eaa..9dd6327 100644
  	return settings.neuralRenderingEyeTrackedFoveation ||
  		(globals::game::isVR && globals::features::vr.stereoOpt.settings.useEyeTracking);
  }
-@@ -453,7 +524,7 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
+@@ -453,7 +525,7 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
  		GetDlssMode() == DlssMode::kDefault && settings.neuralRenderingEnabled &&
  		!globals::features::upscaling.IsFrameGenerationActive() &&
  		!globals::features::openNRCapture.settings.enableCapture &&
@@ -1035,7 +1037,7 @@ index 7977eaa..9dd6327 100644
  	const auto leftUV = subrectController.GetUV();
  	const auto rightUV = subrectController.GetRightEyeUV();
  	const bool geometryCompatible = std::abs(leftUV.w - rightUV.w) <= 0.0005f &&
-@@ -461,44 +532,62 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
+@@ -461,44 +533,62 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
  	const std::uint32_t configuredCoverage = static_cast<std::uint32_t>(std::lround(std::clamp(
  		std::min({ leftUV.w, leftUV.h, rightUV.w, rightUV.h }) * 100.0f, 0.0f, 100.0f)));
  	const bool eyeTrackingOwnsCrop = IsEyeTrackedFoveationEnabled();
@@ -1116,7 +1118,7 @@ index 7977eaa..9dd6327 100644
  	nrConfig.downshiftFrames = settings.neuralRenderingAdaptiveDownshiftFrames;
  	nrConfig.upshiftFrames = settings.neuralRenderingAdaptiveUpshiftFrames;
  	nrConfig.minimumDwellFrames = settings.neuralRenderingAdaptiveMinimumDwellFrames;
-@@ -535,6 +624,12 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
+@@ -535,6 +625,12 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
  		logger::info("[DLSSNR][MEMORY] ceiling {}% -> {}% active={}%; higher tiers held until Neural Rendering Reset or restart",
  			previousMemoryCeiling, adaptiveController.MemoryCeiling(), adaptiveController.ActiveResolution());
  	const bool adaptiveNRActive = nrEligible && adaptiveController.IsEnabled();
@@ -1129,7 +1131,7 @@ index 7977eaa..9dd6327 100644
  	if (nrEligible && previousNR != adaptiveController.ActiveResolution()) {
  		logger::info("[DLSSNR] adaptive NR handoff {}% -> {}% alpha={:.2f} work={:.2f}/{:.2f}ms reason={}",
  			previousNR, adaptiveController.ActiveResolution(), adaptiveController.HandoffAlpha(),
-@@ -556,14 +651,12 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
+@@ -556,14 +652,12 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
  	const auto previousCrop = adaptiveCropController.ActiveCoverage();
  	const auto previousCropTarget = adaptiveCropController.TargetCoverage();
  	const auto previousRenderCrop = adaptiveCropController.RenderCoverage();
@@ -1149,7 +1151,7 @@ index 7977eaa..9dd6327 100644
  	if (cropWasActive && !adaptiveCropController.IsRuntimeActive())
  		FoveatedRenderImpl::Core::ResetAdaptiveCropHandoff();
  	const auto currentCrop = adaptiveCropController.ActiveCoverage();
-@@ -615,8 +708,6 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
+@@ -615,8 +709,6 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
  			adaptiveCropController.Generation(), FoveatedRenderImpl::Core::vrSubrectValidOutW,
  			FoveatedRenderImpl::Core::vrSubrectValidOutH, FoveatedRenderImpl::Core::vrSubrectOutW,
  			FoveatedRenderImpl::Core::vrSubrectOutH);
@@ -1158,7 +1160,7 @@ index 7977eaa..9dd6327 100644
  	}
  	if (adaptiveCropController.IsRuntimeActive() && previousRenderCrop != currentRenderCrop) {
  		// The fixed envelope keeps the native resource identity stable, but the
-@@ -630,10 +721,6 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
+@@ -630,10 +722,6 @@ void FoveatedRender::UpdateAdaptiveState(std::uint32_t frame, bool routeEligible
  			FoveatedRenderImpl::Core::vrSubrectValidOutH, FoveatedRenderImpl::Core::vrSubrectOutW,
  			FoveatedRenderImpl::Core::vrSubrectOutH);
  	}
@@ -1169,7 +1171,7 @@ index 7977eaa..9dd6327 100644
  }
  
  Util::Subrect::UVRegion FoveatedRender::GetEffectiveLeftUV() const
-@@ -716,7 +803,7 @@ uint FoveatedRender::GetActivePresetDLSS() const
+@@ -716,7 +804,7 @@ uint FoveatedRender::GetActivePresetDLSS() const
  
  float FoveatedRender::GetActiveSharpnessDLSS() const
  {
@@ -1178,7 +1180,7 @@ index 7977eaa..9dd6327 100644
  }
  
  float FoveatedRender::GetRenderScaleForQuality(uint qualityMode)
-@@ -1082,8 +1169,9 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1082,8 +1170,9 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  
  			ImGui::SeparatorText("NR Cost / Model Resolution");
  			static const char* modelResolutions[] = {
@@ -1190,7 +1192,7 @@ index 7977eaa..9dd6327 100644
  			int modelResolution = 0;
  			for (int index = 0; index < IM_ARRAYSIZE(modelResolutionValues); ++index) {
  				if (settings.neuralRenderingModelResolution == modelResolutionValues[index]) {
-@@ -1091,19 +1179,21 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1091,19 +1180,21 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  					break;
  				}
  			}
@@ -1215,7 +1217,7 @@ index 7977eaa..9dd6327 100644
  				static constexpr uint adaptiveRefreshValues[] = { 70u, 72u, 80u, 90u };
  				static const char* adaptiveRefreshRates[] = {
  					"70 Hz | 35 FPS budget", "72 Hz | 36 FPS budget", "80 Hz | 40 FPS budget", "90 Hz | 45 FPS budget" };
-@@ -1155,6 +1245,21 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1155,6 +1246,21 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  				if (ImGui::Combo("Adaptive minimum NR cost", &minimumIndex, adaptiveMinimums, IM_ARRAYSIZE(adaptiveMinimums)))
  					settings.neuralRenderingAdaptiveMinimumResolution = adaptiveMinimumValues[minimumIndex];
  
@@ -1237,7 +1239,7 @@ index 7977eaa..9dd6327 100644
  				int downshiftFrames = static_cast<int>(settings.neuralRenderingAdaptiveDownshiftFrames);
  				if (ImGui::SliderInt("NR downshift fade", &downshiftFrames, 1, 16, "%d budget frames"))
  					settings.neuralRenderingAdaptiveDownshiftFrames = static_cast<uint>(downshiftFrames);
-@@ -1171,7 +1276,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1171,7 +1277,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  					adaptiveController.ActiveResolution(), adaptiveController.TargetResolution(),
  					adaptiveController.HandoffAlpha(), adaptiveController.SmoothedFrameTimeMs(),
  					adaptiveController.ApplicationDeadlineMs());
@@ -1246,7 +1248,7 @@ index 7977eaa..9dd6327 100644
  				drawWarningWrapped("Resource setup may hitch once.");
  				ImGui::Checkbox("Show handoff diagnostics", &settings.neuralRenderingAdaptiveDiagnostics);
  			}
-@@ -1184,12 +1289,13 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1184,12 +1290,13 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  			if (!adaptiveCropParentEnabled)
  				ImGui::EndDisabled();
  			if (auto _tt = Util::HoverTooltipWrapper())
@@ -1263,7 +1265,7 @@ index 7977eaa..9dd6327 100644
  				int cropMaximumIndex = 0;
  				for (int index = 0; index < IM_ARRAYSIZE(adaptiveCropMaximumValues); ++index)
  					if (settings.neuralRenderingAdaptiveCropMaximumCoverage == adaptiveCropMaximumValues[index]) {
-@@ -1200,10 +1306,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1200,10 +1307,11 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  					adaptiveCropMaximums, IM_ARRAYSIZE(adaptiveCropMaximums)))
  					settings.neuralRenderingAdaptiveCropMaximumCoverage = adaptiveCropMaximumValues[cropMaximumIndex];
  				if (auto _tt = Util::HoverTooltipWrapper())
@@ -1278,7 +1280,7 @@ index 7977eaa..9dd6327 100644
  				int cropMinimumIndex = IM_ARRAYSIZE(adaptiveCropMinimumValues) - 1;
  				for (int index = 0; index < IM_ARRAYSIZE(adaptiveCropMinimumValues); ++index)
  					if (settings.neuralRenderingAdaptiveCropMinimumCoverage == adaptiveCropMinimumValues[index]) {
-@@ -1232,7 +1339,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1232,7 +1340,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  					adaptiveCropController.HandoffAlpha());
  			}
  			if (IsEyeTrackedFoveationEnabled())
@@ -1287,7 +1289,7 @@ index 7977eaa..9dd6327 100644
  			if (FoveatedRenderImpl::Core::vrSubrectFixedEnvelopeRejected ||
  				FoveatedRenderImpl::Core::vrSubrectNeuralFixedEnvelopeRejected)
  				drawWarningWrapped("Crop held: resource contract failed. Restart required to retry.");
-@@ -1272,31 +1379,77 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1272,31 +1380,77 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  			if (ImGui::Checkbox(T(TKEY("neural_rendering_pre_upscale"), "Experimental pre-upscale NR"), &preUpscale))
  				settings.neuralRenderingPreUpscale = preUpscale ? 1u : 0u;
  			if (auto _tt = Util::HoverTooltipWrapper())
@@ -1376,7 +1378,7 @@ index 7977eaa..9dd6327 100644
  			int temporalReuseMode = 0;
  			for (int index = 0; index < IM_ARRAYSIZE(temporalReuseValues); ++index) {
  				if (settings.neuralRenderingTemporalReuseCadence == temporalReuseValues[index]) {
-@@ -1304,22 +1457,24 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1304,22 +1458,24 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  					break;
  				}
  			}
@@ -1406,7 +1408,7 @@ index 7977eaa..9dd6327 100644
  			}
  
  			ImGui::SeparatorText("Eye-tracked Foveation");
-@@ -1329,12 +1484,33 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1329,12 +1485,33 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  			if (auto _tt = Util::HoverTooltipWrapper())
  				drawWrapped("Optional moving crop for native OpenVR eye tracking. Requires VR, Default mode, and a cropped region; stale gaze falls back to the static crop.");
  			if (settings.neuralRenderingEyeTrackedFoveation) {
@@ -1442,7 +1444,7 @@ index 7977eaa..9dd6327 100644
  				if (!globals::game::isVR)
  					drawWarningWrapped("Native OpenVR gaze is available only in VR.");
  				else if (GetDlssMode() != DlssMode::kDefault)
-@@ -1342,7 +1518,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1342,7 +1519,7 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  				else if (subrectController.GetUV().IsFullEye() && subrectController.GetRightEyeUV().IsFullEye())
  					drawWarningWrapped("Select a cropped eye region before enabling moving gaze.");
  				if (settings.neuralRenderingTemporalReuseCadence != 0)
@@ -1451,7 +1453,7 @@ index 7977eaa..9dd6327 100644
  
  				const auto gaze = FoveatedRenderImpl::NativeOpenVRGaze::GetDiagnostics();
  				ImGui::TextDisabled("Provider: %s | API: %s | Focus: %s | Native sample: %s",
-@@ -1368,7 +1544,25 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1368,7 +1545,25 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  			}
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_intensity"), "Intensity"), &settings.neuralRenderingIntensity, 0.0f, 2.0f, "%.2f");
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_local_tone"), "Local Tone"), &settings.neuralRenderingLocalTone, 0.0f, 2.0f, "%.2f");
@@ -1477,7 +1479,7 @@ index 7977eaa..9dd6327 100644
  			custom |= ImGui::SliderFloat(T(TKEY("neural_rendering_skin_structure"), "Skin Structure"), &settings.neuralRenderingSkinStructure, -1.0f, 2.0f, "%.2f");
  			custom |= ImGui::Checkbox(T(TKEY("neural_rendering_auto_mask"), "Automatic Mask"), &settings.neuralRenderingAutoMask);
  			custom |= ImGui::Checkbox(T(TKEY("neural_rendering_ui_correction"), "UI Correction"), &settings.neuralRenderingUICorrection);
-@@ -1376,10 +1570,10 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
+@@ -1376,10 +1571,10 @@ const char* FoveatedRender::SubrectMaskModeName(SubrectMaskMode mode)
  				settings.neuralRenderingPreset = 5;
  
  				auto& neuralRenderer = NeuralRendering::Renderer::Instance();
