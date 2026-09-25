@@ -1,0 +1,62 @@
+name: OFXR 4x TEST3 apply diagnostic
+
+on:
+  push:
+    branches: [ofxr-4x-test3]
+    paths:
+      - '.github/workflows/ofxr-4x-test3-debug.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct patcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $parts = Get-ChildItem 'ofxr4x/test3_b64/part*' | Sort-Object Name
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'ofxr4x/ofxr4x_test3_pipeline.py'), [Convert]::FromBase64String($b64))
+          python -m py_compile ofxr4x/ofxr4x_test3_pipeline.py
+      - name: Apply with captured diagnostics
+        id: apply
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Continue'
+          $PSNativeCommandUseErrorActionPreference=$false
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src 2>&1 | Tee-Object -FilePath TEST3-apply.log
+          Push-Location ofxr-src
+          git checkout dad56acafc6e1dde219940427738b926cf2ea555 2>&1 | Tee-Object -FilePath ..\TEST3-apply.log -Append
+          Pop-Location
+          python -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')" 2>&1 | Tee-Object -FilePath TEST3-apply.log -Append
+          python ofxr4x/ofxr4x_patch.py ofxr-src 2>&1 | Tee-Object -FilePath TEST3-apply.log -Append
+          python -c "from pathlib import Path; p=Path('ofxr-src/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s and d not in s; p.write_text(s.replace(m,d+m,1),encoding='utf-8')" 2>&1 | Tee-Object -FilePath TEST3-apply.log -Append
+          python ofxr4x/ofxr4x_audit_fixes.py ofxr-src 2>&1 | Tee-Object -FilePath TEST3-apply.log -Append
+          python ofxr4x/ofxr4x_signature_fix.py ofxr-src 2>&1 | Tee-Object -FilePath TEST3-apply.log -Append
+          python ofxr4x/ofxr4x_nvidia_resources.py ofxr-src 2>&1 | Tee-Object -FilePath TEST3-apply.log -Append
+          python ofxr4x/ofxr4x_test3_pipeline.py ofxr-src 2>&1 | Tee-Object -FilePath TEST3-apply.log -Append
+          $code = $LASTEXITCODE
+          Push-Location ofxr-src
+          git diff > ..\TEST3-partial.patch
+          Pop-Location
+          if ($code -ne 0) { exit $code }
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEST3-apply-diagnostic
+          path: |
+            TEST3-apply.log
+            TEST3-partial.patch
+          if-no-files-found: warn
+          retention-days: 3
+      - name: Fail if apply failed
+        if: steps.apply.outcome != 'success'
+        shell: pwsh
+        run: exit 1
