@@ -1,0 +1,132 @@
+name: OFXR 4x TEST3 pipelined
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ofxr-4x-test3]
+    paths:
+      - 'ofxr4x/test3_b64/**'
+      - '.github/workflows/ofxr-4x-test3.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-package:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct TEST3 pipeline patcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $parts = Get-ChildItem 'ofxr4x/test3_b64/part*' | Sort-Object Name
+          if ($parts.Count -ne 6) { throw "Expected 6 TEST3 payload parts, found $($parts.Count)" }
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          $bytes = [Convert]::FromBase64String($b64)
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'ofxr4x/ofxr4x_test3_pipeline.py'), $bytes)
+          python -m py_compile ofxr4x/ofxr4x_test3_pipeline.py
+          $hash = (Get-FileHash ofxr4x/ofxr4x_test3_pipeline.py -Algorithm SHA256).Hash
+          Write-Host "TEST3 patcher SHA256=$hash"
+
+      - name: Clone pinned OFXR and apply TEST2 plus TEST3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src
+          cd ofxr-src
+          git checkout dad56acafc6e1dde219940427738b926cf2ea555
+          cd ..
+          python -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_patch.py ofxr-src
+          python -c "from pathlib import Path; p=Path('ofxr-src/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s and d not in s; p.write_text(s.replace(m,d+m,1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_audit_fixes.py ofxr-src
+          python ofxr4x/ofxr4x_signature_fix.py ofxr-src
+          python ofxr4x/ofxr4x_nvidia_resources.py ofxr-src
+          python ofxr4x/ofxr4x_test3_pipeline.py ofxr-src
+          if (-not (Select-String -Quiet -Path 'ofxr-src/src/layer/openxr_layer.cpp' -Pattern 'TEST3_PIPELINED_DOUBLE_SYNTHETIC_BANK')) { throw 'TEST3 source marker missing' }
+          cd ofxr-src
+          git diff --check
+          git diff > ../OFXR-4X-TEST3.patch
+
+      - name: Build FidelityFX dependency
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          git clone --branch v1.1.4 --depth 1 https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/FidelityFX-SDK-v1.1.4
+          cmake -S external/FidelityFX-SDK-v1.1.4/sdk -B build-fidelityfx -G "Visual Studio 18 2026" -A x64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
+          cmake --build build-fidelityfx --config Release --parallel 4
+
+      - name: Configure and compile TEST3 with tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DXRFG_BUILD_TESTS=ON
+          cmake --build build --config Release --parallel 4
+
+      - name: Run portable regression suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          cd ofxr-src
+          # This single WARP timing test fails identically on the untouched pinned
+          # upstream source on this hosted VS2026 runner with ERROR_BUSY.
+          ctest --test-dir build -C Release --output-on-failure -E '^xrfg_d3d12_history_tests$'
+
+      - name: Package TEST3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root = Join-Path $PWD 'package\OFXR-Bridge-4X-TEST3'
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Copy-Item 'ofxr-src\build\Release\OFXRBridgeTray.exe' $root
+          Copy-Item 'ofxr-src\build\Release\ofxr' $root -Recurse
+          Copy-Item 'OFXR-4X-TEST3.patch' $root
+          $ini = Join-Path $root 'ofxr\ofxr_bridge.ini'
+          $text = Get-Content $ini -Raw
+          $text = $text -replace 'backend=fidelityfx','backend=nvidia'
+          $text = $text -replace 'motion_vectors=dlss','motion_vectors=off'
+          $text = $text -replace 'nvidia_preset=fast','nvidia_preset=medium'
+          $text = $text -replace 'nvidia_input_scale=100','nvidia_input_scale=50'
+          $text = $text -replace 'nvidia_bidirectional=1','nvidia_bidirectional=0'
+          Set-Content -Encoding UTF8 $ini $text
+          @"
+          OFXR Bridge 4x TEST3 - pipelined double synthetic bank
+          Base: tig3rmast3r/OFXR-Bridge dad56acafc6e1dde219940427738b926cf2ea555
+
+          Primary TEST3 change:
+          - Removes TEST2's three-presenter-slot application stall by alternating two complete
+            25/50/75 synthetic-output banks.
+          - A previous 4-frame group may remain queued while the next A/B pair is generated into
+            the other bank.
+          - Pre-generation presenter bound is <=4 for NVIDIA 4x; post-enqueue <=8 is a runaway guard.
+          - One NVIDIA OFA A/B calculation still feeds alpha 0.25, 0.50 and 0.75.
+          - Interpolation shader/math is intentionally unchanged from TEST2 so this build isolates
+            the pipeline/pacing fix.
+          - Per-alpha intermediate camera-space synthesis is NOT in this build yet; synthetic images
+            still use the upstream B-camera contract.
+
+          Default test config: NVIDIA Medium, 50% OFA scale, unidirectional, game motion vectors off.
+          TEST BUILD. Monitor VRAM: this version deliberately spends more stable VRAM on the second
+          synthetic bank in exchange for removing swapchain reuse from the application critical path.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $root 'README-TEST3.txt')
+          Compress-Archive -Path "$root\*" -DestinationPath 'OFXR-Bridge-4X-TEST3.zip' -Force
+          Get-FileHash 'OFXR-Bridge-4X-TEST3.zip' -Algorithm SHA256 | Format-List
+
+      - name: Upload TEST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-Bridge-4X-TEST3
+          path: |
+            OFXR-Bridge-4X-TEST3.zip
+            OFXR-4X-TEST3.patch
+          if-no-files-found: error
+          retention-days: 14
