@@ -1,0 +1,61 @@
+name: OFXR TEST4 shader metrics
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ofxr-4x-test4]
+    paths:
+      - '.github/workflows/ofxr-4x-test4-shader-metrics.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  metrics:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct patchers and sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $t3 = (Get-ChildItem 'ofxr4x/test3_b64/part*' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'ofxr4x/ofxr4x_test3_pipeline.py'), [Convert]::FromBase64String($t3))
+          $t4 = (Get-ChildItem 'ofxr4x/test4_b64/part*' | Sort-Object Name | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          $compressed=[Convert]::FromBase64String($t4); $input=New-Object IO.MemoryStream(,$compressed); $gzip=New-Object IO.Compression.GZipStream($input,[IO.Compression.CompressionMode]::Decompress); $output=New-Object IO.MemoryStream; $gzip.CopyTo($output); $gzip.Dispose(); $input.Dispose(); [IO.File]::WriteAllBytes((Join-Path $PWD 'ofxr4x/ofxr4x_test4_revision.py'),$output.ToArray()); $output.Dispose()
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src
+          cd ofxr-src; git checkout dad56acafc6e1dde219940427738b926cf2ea555; cd ..
+          python -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_patch.py ofxr-src
+          python -c "from pathlib import Path; p=Path('ofxr-src/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s and d not in s; p.write_text(s.replace(m,d+m,1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_audit_fixes.py ofxr-src
+          python ofxr4x/ofxr4x_signature_fix.py ofxr-src
+          python ofxr4x/ofxr4x_nvidia_resources.py ofxr-src
+          python ofxr4x/ofxr4x_test3_pipeline.py ofxr-src
+          Copy-Item ofxr-src/src/d3d12/frame_synthesis.hlsl TEST3.hlsl
+          python ofxr4x/ofxr4x_test4_revision.py ofxr-src
+          Copy-Item ofxr-src/src/d3d12/frame_synthesis.hlsl TEST4.hlsl
+      - name: Compile disassembly and compare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $fxc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\fxc.exe' | Sort-Object FullName | Select-Object -Last 1
+          if (-not $fxc) { throw 'fxc.exe not found' }
+          & $fxc.FullName /nologo /T ps_5_1 /E SynthesizeNvidiaMidpointPS /O3 /Ges /Fc TEST3-midpoint.asm TEST3.hlsl
+          & $fxc.FullName /nologo /T ps_5_1 /E SynthesizeNvidiaQuadPS /O3 /Ges /Fc TEST4-quad.asm TEST4.hlsl
+          Write-Host '=== TEST3 ONE PASS STATS ==='
+          Select-String -Path TEST3-midpoint.asm -Pattern 'instruction slots|texture|approximately' -CaseSensitive:$false | ForEach-Object { $_.Line }
+          Write-Host '=== TEST4 ONE MRT PASS STATS ==='
+          Select-String -Path TEST4-quad.asm -Pattern 'instruction slots|texture|approximately' -CaseSensitive:$false | ForEach-Object { $_.Line }
+          $t3Lines=(Get-Content TEST3-midpoint.asm).Count
+          $t4Lines=(Get-Content TEST4-quad.asm).Count
+          Write-Host "assembly_lines_test3_one=$t3Lines"
+          Write-Host "assembly_lines_test3_three=$($t3Lines*3)"
+          Write-Host "assembly_lines_test4_mrt=$t4Lines"
+          Compress-Archive TEST3-midpoint.asm,TEST4-quad.asm -DestinationPath shader-metrics.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-TEST4-shader-metrics
+          path: shader-metrics.zip
+          retention-days: 3
