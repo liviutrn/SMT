@@ -1,4 +1,4 @@
-name: OpenNR 2.15.1 alternating-eye temporal build
+name: OpenNR 2.15.1 Neural Rendering quality test
 
 on:
   push:
@@ -99,6 +99,7 @@ jobs:
           $shaders = @(
             @{ Path = 'FoveatedRender/CropMotionCS.hlsl'; Entry = 'main' },
             @{ Path = 'FoveatedRender/SubrectBlendCS.hlsl'; Entry = 'main' },
+            @{ Path = 'NeuralRendering/ModelResolutionCS.hlsl'; Entry = 'main' },
             @{ Path = 'RCAS/RCAS.hlsl'; Entry = 'main' },
             @{ Path = 'NeuralRendering/TemporalReuseCS.hlsl'; Entry = 'Snapshot' },
             @{ Path = 'NeuralRendering/TemporalReuseCS.hlsl'; Entry = 'Accumulate' },
@@ -123,22 +124,26 @@ jobs:
           Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl "$root/Shaders/Upscaling/FoveatedRender/CropMotionCS.hlsl"
           Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl "$root/Shaders/Upscaling/FoveatedRender/SubrectBlendCS.hlsl"
           Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/RCAS/RCAS.hlsl "$root/Shaders/Upscaling/RCAS/RCAS.hlsl"
+          Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/NeuralRendering/ModelResolutionCS.hlsl "$root/Shaders/Upscaling/NeuralRendering/ModelResolutionCS.hlsl"
           Copy-Item source/runtime/open-shaders/features/Upscaling/Shaders/Upscaling/NeuralRendering/TemporalReuseCS.hlsl "$root/Shaders/Upscaling/NeuralRendering/TemporalReuseCS.hlsl"
           @'
           Install over OpenNR 2.15.1 with your mod manager, keeping its existing files.
           Back up CommunityShaders.dll before replacing it.
           Enable sharpening on the Neural Rendering page; the strength ranges 0-5 and the placement button selects before/after NR. Colour and brightness preservation plus the gaze crop edge margin are also available.
           Stereo alternating-eye temporal mode defaults off. When enabled, it runs one native NR eye per frame, motion-reprojects the other eye, and accumulates two-frame motion before the next native update. It requires single-pass NR at 100% or matched-residual mode; adaptive, multi-pass, and pre-upscale NR disable it.
-          Try it first with a fixed center crop. Small gaze shifts are compensated; large jumps re-anchor both eyes. Depth changes hard-reject the old residual and color mismatch fades it near the rejection limit. Fast motion may still ghost.
-          Install the DLL and all four shaders together. Disable this overlay to restore your tested gaze build.
-          Source: olekspa/OpenNR b272d732bd22d3ae6e320e03a5f06957492b916d
-          A successful compile does not verify the visual result in a Skyrim VR headset.
+          This test build includes gaze-crop temporal fixes, sequential and pre/post-SR NR controls, adaptive quality, output composition, colour/brightness preservation, and DLSS sharpening.
+          Stage split runs only pass one before DLSS Super Resolution; remaining passes run after it. Two-pass mode can reduce pass two's centered region by 20%, 30%, or 50% and feather it against pass one.
+          Adaptive quality can reduce pass count, crop coverage, and NR processing resolution together. Default order reduces pass count first, then crop, then NR resolution; restoration reverses that order.
+          NR processing scales above 100% increase the NR input/output region resolution; they are not scene supersampling. Sharpening ranges 0-5 and can run before or after NR.
+          Alternate-eye temporal residual reuse remains experimental and restricted to VR single-pass NR. Gaze crop shifts are motion-compensated; large jumps re-anchor history. Fast movement can still ghost or shimmer.
+          Install the DLL and all five shaders together over OpenNR 2.15.1 with a mod manager. Back up existing files first. Successful compilation does not verify image quality in a Skyrim VR headset.
+          Base source: olekspa/OpenNR b272d732bd22d3ae6e320e03a5f06957492b916d.
           '@ | Set-Content install/README.txt
           Get-ChildItem install/Data -File -Recurse | ForEach-Object { $hash = Get-FileHash $_.FullName -Algorithm SHA256; "$($hash.Hash)  $($_.FullName.Substring((Resolve-Path install).Path.Length + 1))" } | Set-Content install/SHA256.txt
 
       - name: Upload installable files
         uses: actions/upload-artifact@v7
         with:
-          name: OpenNR-2.15.1-Gaze-AlternatingEye-Temporal-Test
+          name: OpenNR-2.15.1-Gaze-SequentialNR-Quality-Test
           path: install/
           retention-days: 30
