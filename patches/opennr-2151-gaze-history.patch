@@ -2254,7 +2254,7 @@ index 677517e..efb743f 100644
  
  	struct Diagnostics
 diff --git a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/AdaptiveController.cpp b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/AdaptiveController.cpp
-index 4d57744..9f06eec 100644
+index 4d57744..afd314d 100644
 --- a/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/AdaptiveController.cpp
 +++ b/runtime/open-shaders/src/Features/Upscaling/NeuralRendering/AdaptiveController.cpp
 @@ -49,6 +49,9 @@ namespace NeuralRendering
@@ -2290,7 +2290,7 @@ index 4d57744..9f06eec 100644
  		config_ = {};
  		hasTimestamp_ = false;
  		lastFrame_ = UINT32_MAX;
-@@ -121,9 +125,11 @@ namespace NeuralRendering
+@@ -121,12 +125,13 @@ namespace NeuralRendering
  		decisionReason_ = "hold";
  
  		const Config config = NormalizeConfig(requestedConfig);
@@ -2301,9 +2301,13 @@ index 4d57744..9f06eec 100644
  			config.minimumResolution != config_.minimumResolution ||
 +			config.maximumResolution != config_.maximumResolution ||
  			config.downshiftFrames != config_.downshiftFrames || config.upshiftFrames != config_.upshiftFrames ||
- 			config.minimumDwellFrames != config_.minimumDwellFrames ||
- 			std::abs(config.guardTimeMs - config_.guardTimeMs) > 0.001f;
-@@ -143,6 +149,8 @@ namespace NeuralRendering
+-			config.minimumDwellFrames != config_.minimumDwellFrames ||
+-			std::abs(config.guardTimeMs - config_.guardTimeMs) > 0.001f;
++			config.minimumDwellFrames != config_.minimumDwellFrames;
+ 		config_ = config;
+ 
+ 		const bool shouldRun = config.enabled && eligible;
+@@ -143,6 +148,8 @@ namespace NeuralRendering
  		enabled_ = true;
  		applicationDeadlineMs_ = 1000.0f / std::max(ResolveTargetFps(config), 1.0f);
  		minimumBucket_ = FindBucketIndex(config.minimumResolution);
@@ -2312,7 +2316,7 @@ index 4d57744..9f06eec 100644
  		if (config.memoryPressure)
  			memoryCeiling_ = std::min(memoryCeiling_, ActiveResolution());
  		if (ActiveResolution() > memoryCeiling_)
-@@ -153,6 +161,7 @@ namespace NeuralRendering
+@@ -153,6 +160,7 @@ namespace NeuralRendering
  			targetBucket_ = minimumBucket_;
  		if (configurationChanged) {
  			decisionReason_ = "configuration-change";
@@ -2320,7 +2324,7 @@ index 4d57744..9f06eec 100644
  			transitionFrame_ = 0;
  			transitionFrameCount_ = 0;
  			dwellFrames_ = 0;
-@@ -221,7 +230,7 @@ namespace NeuralRendering
+@@ -221,7 +229,7 @@ namespace NeuralRendering
  		}
  
  		if (config.allowUpshift && !config.memoryPressure && dwellFrames_ >= config.minimumDwellFrames &&
@@ -5943,7 +5947,7 @@ index 539199d..e7b9af3 100644
 +	REQUIRE(controller.ActiveCoverage() == 30);
 +}
 diff --git a/runtime/open-shaders/tests/cpp/test_adaptive_nr_controller.cpp b/runtime/open-shaders/tests/cpp/test_adaptive_nr_controller.cpp
-index 4aa42b2..e2d7915 100644
+index 4aa42b2..b7449b6 100644
 --- a/runtime/open-shaders/tests/cpp/test_adaptive_nr_controller.cpp
 +++ b/runtime/open-shaders/tests/cpp/test_adaptive_nr_controller.cpp
 @@ -29,10 +29,23 @@ TEST_CASE("VRAM pressure ceiling survives headroom and budget edits until explic
@@ -5971,7 +5975,7 @@ index 4aa42b2..e2d7915 100644
  TEST_CASE("Memory ceiling still permits recovery from ordinary workload downshifts", "[adaptive][nr]")
  {
  	NRController controller;
-@@ -74,17 +87,21 @@ TEST_CASE("Adaptive tier changes preserve the handoff but route changes do not",
+@@ -74,20 +87,25 @@ TEST_CASE("Adaptive tier changes preserve the handoff but route changes do not",
  	next = previous;
  	next.depthThreshold = 0.1f;
  	REQUIRE_FALSE(previous.PreservesHandoff(next));
@@ -5995,6 +5999,10 @@ index 4aa42b2..e2d7915 100644
  			count += residency.Contains(candidate);
  		REQUIRE(count == (tier == 0 ? 1 : 2));
  	}
++	residency.Select(6, true);
+ 	residency.Select(5, true);
+ 	REQUIRE(residency.Contains(6));
+ 	REQUIRE(residency.Contains(5));
 diff --git a/runtime/open-shaders/tests/cpp/test_adaptive_quality_order.cpp b/runtime/open-shaders/tests/cpp/test_adaptive_quality_order.cpp
 new file mode 100644
 index 0000000..116f412
