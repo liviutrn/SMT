@@ -69,8 +69,8 @@ jobs:
           py "$env:V04_ROOT/mfg_transport_patch.py" (Resolve-Path 'ofxr').Path
           py "$env:V04_ROOT/dlssg_mfg_quad_patch.py" (Resolve-Path 'ofxr').Path
 
-          # Replace the complete generated_application_period() implementation,
-          # rather than depending on whitespace/formatting from prior patch stages.
+          # Preserve the audited stable-physical-period logic, but make its
+          # multiplier match OFXR_DLSSG_MFG instead of being hardcoded to 4x.
           $env:OFXR_LAYER = (Resolve-Path 'ofxr/src/layer/openxr_layer.cpp').Path
           @'
           from pathlib import Path
@@ -78,43 +78,42 @@ jobs:
           p = Path(os.environ['OFXR_LAYER'])
           s = p.read_text(encoding='utf-8')
           marker = '[[nodiscard]] XrDuration generated_application_period('
-          starts = []
-          pos = 0
+          starts=[]; pos=0
           while True:
-              i = s.find(marker, pos)
-              if i < 0: break
-              starts.append(i)
-              pos = i + len(marker)
-          # One declaration plus one definition is expected after the transport patch.
-          definitions = []
+              i=s.find(marker,pos)
+              if i<0: break
+              starts.append(i); pos=i+len(marker)
+          definitions=[]
           for start in starts:
-              brace = s.find('{', start)
-              semi = s.find(';', start)
-              if brace >= 0 and (semi < 0 or brace < semi):
-                  depth = 0
-                  for j in range(brace, len(s)):
-                      if s[j] == '{': depth += 1
-                      elif s[j] == '}':
-                          depth -= 1
-                          if depth == 0:
-                              definitions.append((start, j + 1))
-                              break
-          if len(definitions) != 1:
+              brace=s.find('{',start); semi=s.find(';',start)
+              if brace>=0 and (semi<0 or brace<semi):
+                  depth=0
+                  for j in range(brace,len(s)):
+                      if s[j]=='{': depth+=1
+                      elif s[j]=='}':
+                          depth-=1
+                          if depth==0:
+                              definitions.append((start,j+1)); break
+          if len(definitions)!=1:
               raise SystemExit(f'expected exactly one generated_application_period definition, got {len(definitions)}')
-          start, end = definitions[0]
-          replacement = '''[[nodiscard]] XrDuration generated_application_period(
+          start,end=definitions[0]
+          replacement='''[[nodiscard]] XrDuration generated_application_period(
               const std::shared_ptr<SessionState>& state,
-              XrDuration period) noexcept {
+              XrDuration reported_period,
+              XrDuration stable_period) noexcept {
+              const XrDuration physical_period = stable_period > 0
+                  ? stable_period
+                  : reported_period;
               const std::uint32_t multiplier =
                   state &&
                   state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
                   xrfg::DlssgPoc::requested()
                       ? xrfg::DlssgPoc::configured_multiplier()
                       : 2U;
-              return multiplied_display_period(period, multiplier);
+              return multiplied_display_period(physical_period, multiplier);
           }'''
-          s = s[:start] + replacement + s[end:]
-          p.write_text(s, encoding='utf-8', newline='\n')
+          s=s[:start]+replacement+s[end:]
+          p.write_text(s,encoding='utf-8',newline='\n')
           '@ | py -
           if($LASTEXITCODE -ne 0){throw 'Dynamic MFG pacing rewrite failed'}
 
@@ -124,7 +123,7 @@ jobs:
           $layer=Get-Content 'ofxr/src/layer/openxr_layer.cpp' -Raw
           $pocsrc=Get-Content 'ofxr/src/d3d12/dlssg_poc.cpp' -Raw
           foreach($needle in @('record_nvidia_quad','configured_multiplier','mfg_index')){if(($cpp+$pocsrc) -notmatch $needle){throw "Missing v0.4 marker: $needle"}}
-          foreach($needle in @('enqueue_presenter_quad','additional_synthetic','synthetic_count','DlssgPoc::configured_multiplier()')){if($layer -notmatch [regex]::Escape($needle)){throw "Missing MFG transport/pacing marker: $needle"}}
+          foreach($needle in @('enqueue_presenter_quad','additional_synthetic','synthetic_count','DlssgPoc::configured_multiplier()','stable_period > 0')){if($layer -notmatch [regex]::Escape($needle)){throw "Missing MFG transport/pacing marker: $needle"}}
           git -C ofxr diff --stat
 
       - name: Build Release x64
@@ -162,7 +161,7 @@ jobs:
           OFXR base: dad56acafc6e1dde219940427738b926cf2ea555
           Enable: OFXR_DLSSG_POC=1
           MFG: OFXR_DLSSG_MFG=2, 3 or 4
-          Pacing: dynamic, tied to OFXR_DLSSG_MFG
+          Pacing: dynamic, tied to OFXR_DLSSG_MFG and stable physical display period
           "@ | Set-Content -Encoding UTF8 (Join-Path $dist 'BUILD-INFO.txt')
           Compress-Archive -Path "$dist/*" -DestinationPath 'OFXR_DLSSG_POC_v0.4_COMPILED.zip' -Force
           Get-FileHash 'OFXR_DLSSG_POC_v0.4_COMPILED.zip' -Algorithm SHA256
