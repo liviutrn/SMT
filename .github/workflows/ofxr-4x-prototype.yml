@@ -53,13 +53,13 @@ jobs:
           cmake -S external/FidelityFX-SDK-v1.1.4/sdk -B build-fidelityfx -G "Visual Studio 18 2026" -A x64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_API_BACKEND=DX12_X64 -DFFX_BUILD_AS_DLL=OFF
           cmake --build build-fidelityfx --config Release --parallel 4
 
-      - name: Configure OFXR
+      - name: Configure OFXR with tests
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cd ofxr-src
-          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DXRFG_BUILD_TESTS=OFF
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DXRFG_BUILD_TESTS=ON
 
       - name: Build OFXR Release
         shell: pwsh
@@ -68,6 +68,14 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cd ofxr-src
           cmake --build build --config Release --parallel 4
+
+      - name: Run upstream CTest suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cd ofxr-src
+          ctest --test-dir build -C Release --output-on-failure
 
       - name: Package prototype
         shell: pwsh
