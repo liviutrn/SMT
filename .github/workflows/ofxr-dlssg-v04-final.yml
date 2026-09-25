@@ -1,0 +1,125 @@
+name: OFXR DLSSG POC v0.4 final
+
+on:
+  push:
+    branches: [ofxr-dlssg-build-v04]
+    paths:
+      - '.github/workflows/ofxr-dlssg-v04-final.yml'
+      - 'ofxr-dlssg-build-v04/**'
+      - 'ofxr4x/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct v0.4 package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $parts = Get-ChildItem 'ofxr-dlssg-build-v04' -File | Where-Object { $_.Name -match '^(poc\.b64\.|rest\.)\d+$' } | Sort-Object @{Expression={ if ($_.Name -like 'poc.b64.*') {0} else {1} }}, @{Expression={ [int]($_.Name -replace '^.*\.', '') }}
+          if ($parts.Count -lt 2) { throw 'Missing staged v0.4 payload chunks' }
+          Write-Host ('Payload chunks: ' + (($parts | ForEach-Object Name) -join ', '))
+          $b64 = (($parts | ForEach-Object { Get-Content -Raw $_.FullName }) -join '').Trim()
+          $zip = Join-Path $env:RUNNER_TEMP 'OFXR_DLSSG_POC_v0.4.zip'
+          [IO.File]::WriteAllBytes($zip,[Convert]::FromBase64String($b64))
+          $hash=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Reconstructed v0.4 SHA256=$hash"
+          $pkg=Join-Path $env:RUNNER_TEMP 'v04pkg'
+          Expand-Archive $zip $pkg -Force
+          $root=Join-Path $pkg 'OFXR_DLSSG_POC_v0.4'
+          foreach($f in @('apply_dlssg_poc.py','mfg_transport_patch.py','dlssg_mfg_quad_patch.py','build_poc.ps1')) { if(!(Test-Path (Join-Path $root $f))){throw "Missing $f in v0.4 package"} }
+          py -m py_compile (Join-Path $root 'apply_dlssg_poc.py') (Join-Path $root 'mfg_transport_patch.py') (Join-Path $root 'dlssg_mfg_quad_patch.py')
+          if($LASTEXITCODE -ne 0){throw 'v0.4 Python syntax validation failed'}
+          "V04_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "V04_HASH=$hash" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Clone exact OFXR base
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr
+          git -C ofxr checkout dad56acafc6e1dde219940427738b926cf2ea555
+          if((git -C ofxr rev-parse HEAD).Trim() -ne 'dad56acafc6e1dde219940427738b926cf2ea555'){throw 'Wrong OFXR base'}
+
+      - name: Apply audited multi-frame transport
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          # The 4x patcher's replacement helper is intentionally relaxed because the pinned upstream has repeated test fixtures.
+          py -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')"
+          py ofxr4x/ofxr4x_patch.py ofxr
+          py -c "from pathlib import Path; p=Path('ofxr/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s; p.write_text(s if d in s else s.replace(m,d+m,1),encoding='utf-8')"
+          py ofxr4x/ofxr4x_audit_fixes.py ofxr
+          py ofxr4x/ofxr4x_signature_fix.py ofxr
+          py ofxr4x/ofxr4x_nvidia_resources.py ofxr
+
+      - name: Apply DLSS-G v0.4 double-wide and MFG
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          py "$env:V04_ROOT/apply_dlssg_poc.py" (Resolve-Path 'ofxr').Path
+          py "$env:V04_ROOT/mfg_transport_patch.py" (Resolve-Path 'ofxr').Path
+          py "$env:V04_ROOT/dlssg_mfg_quad_patch.py" (Resolve-Path 'ofxr').Path
+          git -C ofxr diff --check
+          if($LASTEXITCODE -ne 0){throw 'Patched source failed git diff --check'}
+          $cpp=Get-Content 'ofxr/src/d3d12/d3d12_frame_synthesizer.cpp' -Raw
+          $layer=Get-Content 'ofxr/src/layer/openxr_layer.cpp' -Raw
+          $poc=Get-Content 'ofxr/src/d3d12/dlssg_poc.cpp' -Raw
+          foreach($needle in @('record_nvidia_quad','configured_multiplier','mfg_index')){if(($cpp+$poc) -notmatch $needle){throw "Missing v0.4 marker: $needle"}}
+          foreach($needle in @('enqueue_presenter_quad','additional_synthetic','synthetic_count')){if($layer -notmatch $needle){throw "Missing MFG transport marker: $needle"}}
+          git -C ofxr diff --stat
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          & "$env:V04_ROOT/build_poc.ps1" -Source (Resolve-Path 'ofxr').Path -Build 'build-dlssg-v04'
+          if($LASTEXITCODE -ne 0){throw "Build failed: $LASTEXITCODE"}
+
+      - name: Run portable regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $release=Join-Path (Resolve-Path 'ofxr').Path 'build-dlssg-v04/Release'
+          foreach($t in @('xrfg_core_tests.exe','xrfg_optical_flow_tests.exe','xrfg_fps_overlay_tests.exe','xrfg_bridge_flight_logger_tests.exe')){
+            $p=Join-Path $release $t
+            if(!(Test-Path $p)){throw "Missing regression test $t"}
+            & $p
+            if($LASTEXITCODE -ne 0){throw "$t failed"}
+          }
+
+      - name: Package v0.4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $release=Join-Path (Resolve-Path 'ofxr').Path 'build-dlssg-v04/Release'
+          $dist=Join-Path $PWD 'dist-v04'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item (Join-Path $release 'OFXRBridgeTray.exe') $dist
+          Copy-Item (Join-Path $release 'ofxr') $dist -Recurse
+          Copy-Item "$env:V04_ROOT/README.md" $dist
+          Copy-Item "$env:V04_ROOT/AUDIT.md" $dist
+          @"
+          Build source package SHA256: $env:V04_HASH
+          OFXR base: dad56acafc6e1dde219940427738b926cf2ea555
+          Enable: OFXR_DLSSG_POC=1
+          MFG: OFXR_DLSSG_MFG=2, 3 or 4
+          "@ | Set-Content -Encoding UTF8 (Join-Path $dist 'BUILD-INFO.txt')
+          Compress-Archive -Path "$dist/*" -DestinationPath 'OFXR_DLSSG_POC_v0.4_COMPILED.zip' -Force
+          Get-FileHash 'OFXR_DLSSG_POC_v0.4_COMPILED.zip' -Algorithm SHA256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OFXR_DLSSG_POC_v0.4_COMPILED
+          path: OFXR_DLSSG_POC_v0.4_COMPILED.zip
+          if-no-files-found: error
+          retention-days: 14
