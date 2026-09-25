@@ -1,0 +1,63 @@
+name: OFXR 4x TEST3 source export
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ofxr-4x-test3]
+    paths:
+      - '.github/workflows/ofxr-4x-test3-source-export.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reconstruct TEST3 patcher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $parts = Get-ChildItem 'ofxr4x/test3_b64/part*' | Sort-Object Name
+          $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ''
+          [IO.File]::WriteAllBytes((Join-Path $PWD 'ofxr4x/ofxr4x_test3_pipeline.py'), [Convert]::FromBase64String($b64))
+          python -m py_compile ofxr4x/ofxr4x_test3_pipeline.py
+      - name: Clone and apply TEST3
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $PSNativeCommandUseErrorActionPreference=$true
+          git clone https://github.com/tig3rmast3r/OFXR-Bridge.git ofxr-src
+          cd ofxr-src
+          git checkout dad56acafc6e1dde219940427738b926cf2ea555
+          cd ..
+          python -c "from pathlib import Path; p=Path('ofxr4x/ofxr4x_patch.py'); s=p.read_text(encoding='utf-8'); old='if n != count:'; assert old in s; p.write_text(s.replace(old,'if n < count:',1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_patch.py ofxr-src
+          python -c "from pathlib import Path; p=Path('ofxr-src/src/layer/openxr_layer.cpp'); s=p.read_text(encoding='utf-8'); m='XrResult layer_wait_frame_impl(\n'; d='[[nodiscard]] XrDuration generated_application_period(const std::shared_ptr<SessionState>& state, XrDuration period) noexcept;\n\n'; assert m in s and d not in s; p.write_text(s.replace(m,d+m,1),encoding='utf-8')"
+          python ofxr4x/ofxr4x_audit_fixes.py ofxr-src
+          python ofxr4x/ofxr4x_signature_fix.py ofxr-src
+          python ofxr4x/ofxr4x_nvidia_resources.py ofxr-src
+          python ofxr4x/ofxr4x_test3_pipeline.py ofxr-src
+          cd ofxr-src
+          git diff --check
+          git diff > ../OFXR-4X-TEST3.patch
+      - name: Stage audit source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Force audit-src/src/d3d12,audit-src/src/d3d11,audit-src/src/layer,audit-src/include/xrfg | Out-Null
+          Copy-Item ofxr-src/src/d3d12/d3d12_frame_synthesizer.cpp audit-src/src/d3d12/
+          Copy-Item ofxr-src/src/d3d12/frame_synthesis.hlsl audit-src/src/d3d12/
+          Copy-Item ofxr-src/src/d3d11/d3d11_d3d12_interop.cpp audit-src/src/d3d11/
+          Copy-Item ofxr-src/src/layer/openxr_layer.cpp audit-src/src/layer/
+          Copy-Item ofxr-src/include/xrfg/d3d12_frame_synthesizer.hpp audit-src/include/xrfg/
+          Copy-Item ofxr-src/include/xrfg/d3d11_d3d12_interop.hpp audit-src/include/xrfg/
+          Copy-Item ofxr-src/CMakeLists.txt audit-src/
+          Copy-Item OFXR-4X-TEST3.patch audit-src/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OFXR-4X-TEST3-audit-source
+          path: audit-src
+          retention-days: 3
