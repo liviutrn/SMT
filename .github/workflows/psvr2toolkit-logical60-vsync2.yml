@@ -1,0 +1,210 @@
+name: Build PSVR2Toolkit logical-60Hz VSync-div2 experiment
+
+on:
+  push:
+    branches:
+      - experiment/psvr2toolkit-logical60-vsync2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TOOLKIT_COMMIT: 5daea3856fda4399bbe61b7f9bc872ea7b321a43
+  BUILD_TYPE: RelWithDebInfo
+
+jobs:
+  build-windows:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Clone pinned PSVR2Toolkit
+        shell: pwsh
+        run: |
+          git clone --recursive https://github.com/BnuuySolutions/PSVR2Toolkit.git toolkit
+          Set-Location toolkit
+          git checkout $env:TOOLKIT_COMMIT
+          git submodule update --init --recursive
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:TOOLKIT_COMMIT) { throw "Unexpected Toolkit commit: $head" }
+
+      - name: Apply coherent logical-60Hz patch
+        shell: pwsh
+        run: |
+          $hmdPath = "toolkit/projects/psvr2_openvr_driver_ex/driver_hooks/hmd_device_hooks.cpp"
+          $proxyHeaderPath = "toolkit/projects/psvr2_openvr_driver_ex/driver_host_proxy.h"
+          $proxyCppPath = "toolkit/projects/psvr2_openvr_driver_ex/driver_host_proxy.cpp"
+
+          # 1) Give DriverHostProxy a gated, resettable 2:1 VSync divider.
+          $header = Get-Content -LiteralPath $proxyHeaderPath -Raw
+          $oldIncludes = @'
+          #include <list>
+          '@
+          $newIncludes = @'
+          #include <atomic>
+          #include <cstdint>
+          #include <list>
+          '@
+          if (([regex]::Matches($header, [regex]::Escape($oldIncludes))).Count -ne 1) { throw "Header include anchor mismatch." }
+          $header = $header.Replace($oldIncludes, $newIncludes)
+
+          $oldPublic = @'
+            void SetDriverHost(vr::IVRServerDriverHost *pDriverHost);
+            void AddEventHandler(void (*pfnEventHandler)(vr::VREvent_t *)); // Required for intercepting polled events from the PS VR2 driver.
+          '@
+          $newPublic = @'
+            void SetDriverHost(vr::IVRServerDriverHost *pDriverHost);
+            void AddEventHandler(void (*pfnEventHandler)(vr::VREvent_t *)); // Required for intercepting polled events from the PS VR2 driver.
+
+            // Experimental logical-60Hz mode: Sony remains in its physical 120Hz mode,
+            // while SteamVR receives one timing event for every two physical VSyncs.
+            void SetExperimentalVsyncDividerBy2(bool enabled) {
+              m_experimentalVsyncDividerBy2.store(enabled, std::memory_order_relaxed);
+              m_experimentalVsyncCounter.store(0, std::memory_order_relaxed);
+            }
+          '@
+          if (([regex]::Matches($header, [regex]::Escape($oldPublic))).Count -ne 1) { throw "Header public anchor mismatch." }
+          $header = $header.Replace($oldPublic, $newPublic)
+
+          $oldPrivate = @'
+            vr::IVRServerDriverHost *m_pDriverHost;
+            std::list<void (*)(vr::VREvent_t *)> m_pfnEventHandlers;
+          '@
+          $newPrivate = @'
+            vr::IVRServerDriverHost *m_pDriverHost;
+            std::list<void (*)(vr::VREvent_t *)> m_pfnEventHandlers;
+
+            std::atomic<bool> m_experimentalVsyncDividerBy2{false};
+            std::atomic<uint64_t> m_experimentalVsyncCounter{0};
+          '@
+          if (([regex]::Matches($header, [regex]::Escape($oldPrivate))).Count -ne 1) { throw "Header private anchor mismatch." }
+          $header = $header.Replace($oldPrivate, $newPrivate)
+          Set-Content -LiteralPath $proxyHeaderPath -Value $header -NoNewline
+
+          # 2) Divide only the timing notifications sent to SteamVR. This does not command
+          #    Sony's hardware or change the physical DisplayPort mode.
+          $proxyCpp = Get-Content -LiteralPath $proxyCppPath -Raw
+          $oldVsync = 'void DriverHostProxy::VsyncEvent(double vsyncTimeOffsetSeconds) { m_pDriverHost->VsyncEvent(vsyncTimeOffsetSeconds); }'
+          $newVsync = @'
+          void DriverHostProxy::VsyncEvent(double vsyncTimeOffsetSeconds) {
+            if (!m_experimentalVsyncDividerBy2.load(std::memory_order_relaxed)) {
+              m_pDriverHost->VsyncEvent(vsyncTimeOffsetSeconds);
+              return;
+            }
+
+            const uint64_t physicalVsyncIndex = m_experimentalVsyncCounter.fetch_add(1, std::memory_order_relaxed);
+            if ((physicalVsyncIndex & 1ULL) == 0) {
+              m_pDriverHost->VsyncEvent(vsyncTimeOffsetSeconds);
+            }
+          }
+          '@
+          if (([regex]::Matches($proxyCpp, [regex]::Escape($oldVsync))).Count -ne 1) { throw "VSync proxy anchor mismatch." }
+          $proxyCpp = $proxyCpp.Replace($oldVsync, $newVsync)
+          Set-Content -LiteralPath $proxyCppPath -Value $proxyCpp -NoNewline
+
+          # 3) After Sony successfully activates at ~120Hz, report 60Hz and enable div2.
+          #    If any validation/write fails, div2 remains disabled.
+          $hmd = Get-Content -LiteralPath $hmdPath -Raw
+          $oldRuntime = @'
+            // Tell SteamVR to allow runtime framerate changes.
+            // SteamVR does not allow this feature on AMD GPUs, so this is NVIDIA-only currently.
+            vr::VRProperties()->SetBoolProperty(ulPropertyContainer, vr::Prop_DisplaySupportsRuntimeFramerateChange_Bool, true);
+          '@
+          $newRuntime = @'
+            // EXPERIMENTAL logical 60Hz: do not allow SteamVR to request a physical mode switch.
+            vr::VRProperties()->SetBoolProperty(ulPropertyContainer, vr::Prop_DisplaySupportsRuntimeFramerateChange_Bool, false);
+
+            // Fail safe: passthrough 120Hz VSync unless the 120->60 property override succeeds.
+            DriverHostProxy::Instance()->SetExperimentalVsyncDividerBy2(false);
+
+            if (result == vr::VRInitError_None) {
+              vr::ETrackedPropertyError frequencyReadError = vr::TrackedProp_Success;
+              const float originalReportedFrequency =
+                  vr::VRProperties()->GetFloatProperty(ulPropertyContainer, vr::Prop_DisplayFrequency_Float, &frequencyReadError);
+
+              if (frequencyReadError != vr::TrackedProp_Success) {
+                Util::DriverLog("[Logical60Hz] Failed to read DisplayFrequency (error {}). Staying native.",
+                                static_cast<int>(frequencyReadError));
+              } else if (std::fabs(originalReportedFrequency - 120.0f) > 2.0f) {
+                Util::DriverLog("[Logical60Hz] Refusing override: source reports {} Hz, not ~120 Hz. Staying native.",
+                                originalReportedFrequency);
+              } else {
+                const vr::ETrackedPropertyError frequencyWriteError =
+                    vr::VRProperties()->SetFloatProperty(ulPropertyContainer, vr::Prop_DisplayFrequency_Float, 60.0f);
+
+                if (frequencyWriteError == vr::TrackedProp_Success) {
+                  DriverHostProxy::Instance()->SetExperimentalVsyncDividerBy2(true);
+                  Util::DriverLog("[Logical60Hz] Source {} Hz; reporting 60 Hz and forwarding every second VSync.",
+                                  originalReportedFrequency);
+                } else {
+                  Util::DriverLog("[Logical60Hz] Failed to set DisplayFrequency=60 (error {}). Staying native.",
+                                  static_cast<int>(frequencyWriteError));
+                }
+              }
+            }
+          '@
+          if (([regex]::Matches($hmd, [regex]::Escape($oldRuntime))).Count -ne 1) { throw "HMD runtime-framerate anchor mismatch." }
+          $hmd = $hmd.Replace($oldRuntime, $newRuntime)
+
+          $oldDeactivate = 'void sie__psvr2__HmdDevice__DeactivateHook(void *thisptr) { sie__psvr2__HmdDevice__Deactivate(thisptr); }'
+          $newDeactivate = @'
+          void sie__psvr2__HmdDevice__DeactivateHook(void *thisptr) {
+            DriverHostProxy::Instance()->SetExperimentalVsyncDividerBy2(false);
+            sie__psvr2__HmdDevice__Deactivate(thisptr);
+          }
+          '@
+          if (([regex]::Matches($hmd, [regex]::Escape($oldDeactivate))).Count -ne 1) { throw "HMD deactivate anchor mismatch." }
+          $hmd = $hmd.Replace($oldDeactivate, $newDeactivate)
+          Set-Content -LiteralPath $hmdPath -Value $hmd -NoNewline
+
+          # Auditable safety checks.
+          $all = (Get-Content -LiteralPath $hmdPath -Raw) + (Get-Content -LiteralPath $proxyHeaderPath -Raw) + (Get-Content -LiteralPath $proxyCppPath -Raw)
+          if ($all -notmatch '\[Logical60Hz\]') { throw "Missing Logical60Hz diagnostics." }
+          if ($all -notmatch 'Prop_DisplayFrequency_Float, 60\.0f') { throw "Missing 60Hz property override." }
+          if ($all -notmatch 'physicalVsyncIndex & 1ULL') { throw "Missing VSync divide-by-two logic." }
+
+          git -C toolkit diff --check
+          git -C toolkit diff -- projects/psvr2_openvr_driver_ex/driver_hooks/hmd_device_hooks.cpp projects/psvr2_openvr_driver_ex/driver_host_proxy.h projects/psvr2_openvr_driver_ex/driver_host_proxy.cpp
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S toolkit -B toolkit/build -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build toolkit/build --config $env:BUILD_TYPE
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item -Path "toolkit/build/bin/$env:BUILD_TYPE/*" -Destination artifacts -Recurse -Force
+          @"
+          PSVR2Toolkit EXPERIMENTAL logical-60Hz VSync-div2 build
+          ======================================================
+
+          Base Toolkit commit: $env:TOOLKIT_COMMIT
+
+          Behavior:
+          - Sony initializes the PSVR2 normally; this patch does not request a 60Hz hardware mode.
+          - Override only activates when the source DisplayFrequency is within 120 +/- 2 Hz.
+          - SteamVR is told DisplayFrequency = 60 Hz.
+          - Toolkit forwards only every second Sony VsyncEvent to SteamVR.
+          - Runtime framerate switching is disabled for this experiment.
+          - Divider is disabled before validation and again on HMD deactivation.
+          - If frequency read/write fails or source is not ~120Hz, VSync remains native passthrough.
+
+          Expected vrserver log:
+          [Logical60Hz] Source 120... Hz; reporting 60 Hz and forwarding every second VSync.
+
+          Goal:
+          physical PSVR2 = 120Hz
+          logical SteamVR compositor timing = 60Hz
+          game = 30fps
+          SteamVR Motion Smoothing target = 30->60 (one synthetic frame per real frame)
+          "@ | Set-Content -LiteralPath "artifacts/EXPERIMENTAL_LOGICAL60_VSYNC_DIV2_README.txt"
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: PSVR2Toolkit-EXPERIMENTAL-logical60-vsync-div2
+          path: artifacts
