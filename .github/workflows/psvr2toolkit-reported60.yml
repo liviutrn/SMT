@@ -1,0 +1,128 @@
+name: Build PSVR2Toolkit reported-60Hz experiment
+
+on:
+  push:
+    branches:
+      - experiment/psvr2toolkit-reported-60hz
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TOOLKIT_COMMIT: 5daea3856fda4399bbe61b7f9bc872ea7b321a43
+  BUILD_TYPE: RelWithDebInfo
+
+jobs:
+  build-windows:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Clone pinned PSVR2Toolkit
+        shell: pwsh
+        run: |
+          git clone --recursive https://github.com/BnuuySolutions/PSVR2Toolkit.git toolkit
+          Set-Location toolkit
+          git checkout $env:TOOLKIT_COMMIT
+          git submodule update --init --recursive
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:TOOLKIT_COMMIT) { throw "Unexpected Toolkit commit: $head" }
+
+      - name: Apply reported-60Hz / physical-120Hz experiment
+        shell: pwsh
+        run: |
+          $path = "toolkit/projects/psvr2_openvr_driver_ex/driver_hooks/hmd_device_hooks.cpp"
+          $content = Get-Content -LiteralPath $path -Raw
+
+          $old = @'
+            // Tell SteamVR to allow runtime framerate changes.
+            // SteamVR does not allow this feature on AMD GPUs, so this is NVIDIA-only currently.
+            vr::VRProperties()->SetBoolProperty(ulPropertyContainer, vr::Prop_DisplaySupportsRuntimeFramerateChange_Bool, true);
+          '@
+
+          $new = @'
+            // EXPERIMENTAL: keep Sony's already-selected physical display mode fixed.
+            // This build is intended to start PSVR2 physically at 120 Hz, then report a
+            // logical 60 Hz cadence to SteamVR for motion-smoothing experimentation.
+            vr::VRProperties()->SetBoolProperty(ulPropertyContainer, vr::Prop_DisplaySupportsRuntimeFramerateChange_Bool, false);
+
+            if (result == vr::VRInitError_None) {
+              vr::ETrackedPropertyError frequencyReadError = vr::TrackedProp_Success;
+              const float originalReportedFrequency =
+                  vr::VRProperties()->GetFloatProperty(ulPropertyContainer, vr::Prop_DisplayFrequency_Float, &frequencyReadError);
+
+              if (frequencyReadError != vr::TrackedProp_Success) {
+                Util::DriverLog("[Reported60Hz] Failed to read Prop_DisplayFrequency_Float (error {}). Leaving it unchanged.",
+                                static_cast<int>(frequencyReadError));
+              } else if (std::fabs(originalReportedFrequency - 120.0f) > 2.0f) {
+                Util::DriverLog("[Reported60Hz] Refusing override because physical/source frequency is {} Hz, not ~120 Hz.",
+                                originalReportedFrequency);
+              } else {
+                const vr::ETrackedPropertyError frequencyWriteError =
+                    vr::VRProperties()->SetFloatProperty(ulPropertyContainer, vr::Prop_DisplayFrequency_Float, 60.0f);
+
+                if (frequencyWriteError == vr::TrackedProp_Success) {
+                  Util::DriverLog("[Reported60Hz] Physical/source frequency was {} Hz; SteamVR is now being told 60 Hz.",
+                                  originalReportedFrequency);
+                } else {
+                  Util::DriverLog("[Reported60Hz] Failed to set Prop_DisplayFrequency_Float to 60 Hz (error {}).",
+                                  static_cast<int>(frequencyWriteError));
+                }
+              }
+            }
+          '@
+
+          $matches = ([regex]::Matches($content, [regex]::Escape($old))).Count
+          if ($matches -ne 1) {
+            throw "Safety check failed: expected exactly one runtime-framerate block, found $matches. Upstream source may have changed."
+          }
+
+          $patched = $content.Replace($old, $new)
+          Set-Content -LiteralPath $path -Value $patched -NoNewline
+
+          if ($patched -notmatch '\[Reported60Hz\]' -or $patched -notmatch 'Prop_DisplayFrequency_Float, 60\.0f') {
+            throw "Patch verification failed."
+          }
+
+          git -C toolkit diff --check
+          git -C toolkit diff -- projects/psvr2_openvr_driver_ex/driver_hooks/hmd_device_hooks.cpp
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S toolkit -B toolkit/build -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build toolkit/build --config $env:BUILD_TYPE
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item -Path "toolkit/build/bin/$env:BUILD_TYPE/*" -Destination artifacts -Recurse -Force
+          @"
+          PSVR2Toolkit EXPERIMENTAL reported-60Hz build
+          =============================================
+
+          Base: BnuuySolutions/PSVR2Toolkit
+          Commit: $env:TOOLKIT_COMMIT
+
+          Experiment:
+          - Sony/PSVR2 physical display mode is NOT changed by this patch.
+          - Start SteamVR with the headset physically configured for 120 Hz.
+          - Toolkit reads the original HMD DisplayFrequency after successful activation.
+          - It only overrides 119-121-ish Hz sources (120 +/- 2 Hz) to report 60 Hz to SteamVR.
+          - Runtime framerate switching support is disabled in this experimental build to reduce the risk of SteamVR trying to reconcile the logical 60 Hz report by switching the physical mode.
+          - The property is written only once per successful HMD activation; it is not rewritten every frame.
+          - No VSync interception or frame-generation code is added.
+
+          Expected diagnostic log:
+          [Reported60Hz] Physical/source frequency was 120... Hz; SteamVR is now being told 60 Hz.
+
+          If SteamVR timing becomes unstable, close SteamVR and restore your normal PSVR2Toolkit build.
+          "@ | Set-Content -LiteralPath "artifacts/EXPERIMENTAL_REPORTED_60HZ_README.txt"
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: PSVR2Toolkit-EXPERIMENTAL-reported60-physical120
+          path: artifacts
