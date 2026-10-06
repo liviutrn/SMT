@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(SteamVRPrismVectorFix LANGUAGES CXX)
+add_executable(SteamVRPrismVectorFix PrismVectorFix.cpp)
+target_compile_features(SteamVRPrismVectorFix PRIVATE cxx_std_17)
+target_link_libraries(SteamVRPrismVectorFix PRIVATE bcrypt advapi32)
+target_compile_definitions(SteamVRPrismVectorFix PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
