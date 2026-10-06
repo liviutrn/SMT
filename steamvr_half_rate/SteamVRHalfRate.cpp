@@ -1,4 +1,3 @@
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <atomic>
 #include <cstdint>
@@ -82,11 +81,11 @@ static DWORD WINAPI WorkerThread(LPVOID) {
         return 0;
     }
 
-    EVRInitError err = VRInitError_None;
+    EVRInitError err = EVRInitError_VRInitError_None;
     auto* compositor = reinterpret_cast<VR_IVRCompositor_FnTable*>(
         getInterface("FnTable:IVRCompositor_029", &err));
 
-    if (!compositor || err != VRInitError_None) {
+    if (!compositor || err != EVRInitError_VRInitError_None) {
         Log("ERROR: IVRCompositor_029 function table unavailable. err=%d ptr=%p",
             static_cast<int>(err), compositor);
         return 0;
