@@ -1,0 +1,46 @@
+name: Build SteamVRHalfRate library helper
+
+on:
+  push:
+    branches:
+      - experiment/steamvr-library-half-rate
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone pinned OpenVR SDK
+        shell: pwsh
+        run: |
+          git clone https://github.com/ValveSoftware/openvr.git openvr
+          Set-Location openvr
+          git checkout 0924064316de3effbcd1acf1e309182a2deb1c05
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S steamvr_library_half_rate -B build -A x64 -DOPENVR_ROOT="$pwd/openvr"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item build/Release/SteamVRHalfRate.exe package/
+          Copy-Item openvr/bin/win64/openvr_api.dll package/
+          Copy-Item steamvr_library_half_rate/README_TEST.txt package/
+          Compress-Archive -Path package/* -DestinationPath SteamVRHalfRate-LIBRARY-WIDE-EXPERIMENT.zip -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SteamVRHalfRate-LIBRARY-WIDE-EXPERIMENT
+          path: SteamVRHalfRate-LIBRARY-WIDE-EXPERIMENT.zip
