@@ -215,7 +215,7 @@ cleanup:
 } // namespace
 
 int wmain() {
-    std::puts("SteamVR Motion Smoothing - midpoint-only 30->60 experiment");
+    std::puts("SteamVR Motion Smoothing - quality/smoothness v2 experiment");
     std::puts("Version locked to the user's exact SteamVR 2.18.2 vrcompositor.exe.");
     std::puts("");
 
@@ -244,11 +244,11 @@ int wmain() {
 
     std::printf("Matched exact vrcompositor.exe. PID=%lu\n", pid);
 
-    const auto dllPath = ExeDir() / L"SteamVRMSMidpointHook.dll";
+    const auto dllPath = ExeDir() / L"SteamVRMSQualityV2Hook.dll";
 
     if (IsRemoteModuleLoaded(pid, dllPath.filename().c_str())) {
         std::puts("Hook DLL is already loaded in vrcompositor.");
-        std::puts("Ctrl+Alt+I toggles midpoint-only filtering live.");
+        std::puts("Ctrl+Alt+1..5 selects modes; Ctrl+Alt+I toggles Native vs selected mode.");
         CloseHandle(process);
         return 0;
     }
@@ -263,10 +263,10 @@ int wmain() {
 
     std::puts("");
     std::puts("Injected successfully.");
-    std::puts("30->120 only: 25% and 75% hallucinations are suppressed; 50% midpoint remains.");
+    std::puts("30->120 only: choose Native, SoftFar, ClampFar, Drop75, or MidpointOnly live.");
     std::puts("All other SteamVR reprojection ratios stay native.");
-    std::puts("Ctrl+Alt+I toggles the filtering live.");
+    std::puts("Ctrl+Alt+1..5 selects modes; Ctrl+Alt+I provides live A/B against Native.");
     std::puts("Restart SteamVR to fully unload the hook.");
-    std::puts("See SteamVRMSMidpoint.log beside this EXE/DLL for counters.");
+    std::puts("See SteamVRMSQualityV2.log beside this EXE/DLL for counters.");
     return 0;
 }
