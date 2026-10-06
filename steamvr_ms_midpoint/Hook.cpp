@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 #include <filesystem>
 
 #include <MinHook.h>
@@ -13,8 +14,6 @@ namespace {
 
 constexpr std::uintptr_t kTargetRva = 0x001217B0;
 
-// Exact first 32 bytes from the user's uploaded SteamVR 2.18.2 vrcompositor.exe
-// SHA-256: 5dabeae9a0ac12d7c47a3aed9576c0d5116039eafffb47756fd674605d1fe554
 constexpr unsigned char kExpectedTargetBytes[] = {
     0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,
     0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48,
@@ -29,17 +28,36 @@ using SelectMotionVectorsFn =
                      void* output,
                      bool modeFlag);
 
+enum class Mode : int {
+    Native = 1,
+    SoftFar = 2,
+    ClampFar = 3,
+    DropFar = 4,
+    MidpointOnly = 5,
+};
+
 SelectMotionVectorsFn g_original = nullptr;
-std::atomic<bool> g_enabled{true};
+std::atomic<Mode> g_mode{Mode::SoftFar};
+std::atomic<Mode> g_lastNonNative{Mode::SoftFar};
 std::atomic<bool> g_running{true};
 
-std::atomic<std::uint64_t> g_calls{0};
-std::atomic<std::uint64_t> g_gap4Calls{0};
-std::atomic<std::uint64_t> g_midpointPasses{0};
-std::atomic<std::uint64_t> g_outerSuppressions{0};
+std::atomic<std::uint64_t> g_calls{0}, g_gap4{0};
+std::atomic<std::uint64_t> g_d1{0}, g_d2{0}, g_d3{0};
+std::atomic<std::uint64_t> g_soft{0}, g_clamp{0}, g_drop75{0}, g_outerDrop{0};
 
 HMODULE g_self = nullptr;
 FILE* g_log = nullptr;
+
+const char* ModeName(Mode mode) {
+    switch (mode) {
+    case Mode::Native:       return "NATIVE";
+    case Mode::SoftFar:      return "SOFT_FAR_62.5";
+    case Mode::ClampFar:     return "CLAMP_FAR_TO_50";
+    case Mode::DropFar:      return "DROP_75_ONLY";
+    case Mode::MidpointOnly: return "MIDPOINT_ONLY";
+    default:                 return "UNKNOWN";
+    }
+}
 
 std::filesystem::path ModuleDir(HMODULE module) {
     wchar_t path[MAX_PATH]{};
@@ -49,7 +67,7 @@ std::filesystem::path ModuleDir(HMODULE module) {
 
 void Log(const char* fmt, ...) {
     if (!g_log && g_self) {
-        const auto path = ModuleDir(g_self) / L"SteamVRMSMidpoint.log";
+        const auto path = ModuleDir(g_self) / L"SteamVRMSQualityV2.log";
         _wfopen_s(&g_log, path.c_str(), L"a");
     }
     if (!g_log) return;
@@ -58,7 +76,6 @@ void Log(const char* fmt, ...) {
     GetLocalTime(&st);
     std::fprintf(g_log, "[%02u:%02u:%02u.%03u] ",
                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
     va_list args;
     va_start(args, fmt);
     std::vfprintf(g_log, fmt, args);
@@ -75,6 +92,29 @@ bool BytesMatch(const void* address, const unsigned char* expected, std::size_t 
     }
 }
 
+// In the exact 2.18.2 selector, target-time scale contributes linearly to
+// these output floats and their mirrors. Reference/history-gap fields are
+// separate and intentionally left untouched.
+bool ScaleTargetTimeFields(void* output, float factor) {
+    constexpr std::size_t offsets[] = {0x004,0x008,0x00C,0x2C4,0x2C8,0x2CC};
+    __try {
+        auto* bytes = reinterpret_cast<unsigned char*>(output);
+        for (std::size_t off : offsets) {
+            auto* v = reinterpret_cast<float*>(bytes + off);
+            *v *= factor;
+        }
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void SetMode(Mode mode, const char* why) {
+    g_mode.store(mode, std::memory_order_relaxed);
+    if (mode != Mode::Native) g_lastNonNative.store(mode, std::memory_order_relaxed);
+    Log("MODE -> %s [%s]", ModeName(mode), why);
+}
+
 bool __fastcall HookSelectMotionVectors(void* manager,
                                         std::uint32_t inputVsyncId,
                                         std::uint32_t targetVsyncId,
@@ -83,16 +123,8 @@ bool __fastcall HookSelectMotionVectors(void* manager,
     g_calls.fetch_add(1, std::memory_order_relaxed);
 
     const bool ok = g_original(manager, inputVsyncId, targetVsyncId, output, modeFlag);
-    if (!ok || !g_enabled.load(std::memory_order_relaxed) || !output) {
-        return ok;
-    }
+    if (!ok || !output) return ok;
 
-    // In this exact compositor build, on successful return:
-    //   output + 0x258 = (InputVsyncId - ReferenceVsyncId) * 0.5f
-    //
-    // Therefore a 30-fps source on a 120-Hz compositor has a VSync gap of 4
-    // and this field is exactly 2.0f. Target-Input is then 1, 2, 3 for the
-    // 25%, 50%, 75% synthetic slots.
     float halfReferenceGap = 0.0f;
     __try {
         halfReferenceGap = *reinterpret_cast<float*>(
@@ -101,142 +133,147 @@ bool __fastcall HookSelectMotionVectors(void* manager,
         return ok;
     }
 
-    if (std::fabs(halfReferenceGap - 2.0f) > 0.01f) {
-        // Preserve SteamVR native behavior at every ratio other than 30->120.
+    // 30->120 only: Input-Reference = 4, therefore output+0x258 = 2.0.
+    if (std::fabs(halfReferenceGap - 2.0f) > 0.01f) return ok;
+
+    g_gap4.fetch_add(1, std::memory_order_relaxed);
+    const std::uint32_t delta = targetVsyncId - inputVsyncId;
+    if (delta == 1) g_d1.fetch_add(1, std::memory_order_relaxed);
+    if (delta == 2) g_d2.fetch_add(1, std::memory_order_relaxed);
+    if (delta == 3) g_d3.fetch_add(1, std::memory_order_relaxed);
+
+    const Mode mode = g_mode.load(std::memory_order_relaxed);
+    if (mode == Mode::Native) return ok;
+
+    if (mode == Mode::SoftFar) {
+        // Native 75% -> 62.5%: half-way back toward the 50% midpoint.
+        // 0.75 * 5/6 = 0.625. Keeps a unique far scene state but reduces
+        // extrapolation beyond midpoint by one third.
+        if (delta == 3 && ScaleTargetTimeFields(output, 5.0f/6.0f))
+            g_soft.fetch_add(1, std::memory_order_relaxed);
         return ok;
     }
 
-    g_gap4Calls.fetch_add(1, std::memory_order_relaxed);
-
-    const std::uint32_t delta = targetVsyncId - inputVsyncId;
-
-    if (delta == 2) {
-        // Keep exactly the midpoint hallucination: 30 -> 60 scene cadence.
-        g_midpointPasses.fetch_add(1, std::memory_order_relaxed);
-        return true;
+    if (mode == Mode::ClampFar) {
+        // Native 75% -> 50% without leaving the Motion Smoothing path.
+        // This tests whether v1's roughness was partly the false/fallback path.
+        if (delta == 3 && ScaleTargetTimeFields(output, 2.0f/3.0f))
+            g_clamp.fetch_add(1, std::memory_order_relaxed);
+        return ok;
     }
 
-    if (delta == 1 || delta == 3) {
-        // Reject the 25% and 75% hallucinations. The compositor still runs
-        // physically at 120 Hz and can do its ordinary pose reprojection on
-        // these presentation slots.
-        g_outerSuppressions.fetch_add(1, std::memory_order_relaxed);
-        return false;
+    if (mode == Mode::DropFar) {
+        // Keep the two shortest predictions (25%, 50%) and reject only 75%.
+        if (delta == 3) {
+            g_drop75.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        return ok;
     }
 
-    // Unexpected target relation: fail open to native SteamVR behavior.
+    if (mode == Mode::MidpointOnly) {
+        // Exact v1 behavior.
+        if (delta == 1 || delta == 3) {
+            g_outerDrop.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        return ok;
+    }
+
     return ok;
 }
 
 DWORD WINAPI ControlThread(LPVOID) {
     Log("============================================================");
-    Log("SteamVR Motion Smoothing midpoint-only hook loaded.");
+    Log("SteamVR Motion Smoothing quality/smoothness v2 hook loaded.");
     Log("Target RVA=0x%llX", static_cast<unsigned long long>(kTargetRva));
 
     HMODULE exe = GetModuleHandleW(nullptr);
-    if (!exe) {
-        Log("ERROR: GetModuleHandleW(nullptr) failed.");
-        return 1;
-    }
+    if (!exe) { Log("ERROR: no main module."); return 1; }
 
     const auto target = reinterpret_cast<unsigned char*>(exe) + kTargetRva;
     if (!BytesMatch(target, kExpectedTargetBytes, sizeof(kExpectedTargetBytes))) {
-        Log("ERROR: vrcompositor target signature mismatch. Refusing to hook.");
-        Log("This build is locked to the user's exact SteamVR 2.18.2 binary.");
+        Log("ERROR: target signature mismatch; refusing hook.");
         return 2;
     }
 
-    if (MH_Initialize() != MH_OK) {
-        Log("ERROR: MH_Initialize failed.");
-        return 3;
-    }
-
-    if (MH_CreateHook(target,
-                      reinterpret_cast<void*>(&HookSelectMotionVectors),
+    if (MH_Initialize() != MH_OK) { Log("ERROR: MH_Initialize."); return 3; }
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&HookSelectMotionVectors),
                       reinterpret_cast<void**>(&g_original)) != MH_OK) {
-        Log("ERROR: MH_CreateHook failed.");
+        Log("ERROR: MH_CreateHook.");
         MH_Uninitialize();
         return 4;
     }
-
     if (MH_EnableHook(target) != MH_OK) {
-        Log("ERROR: MH_EnableHook failed.");
+        Log("ERROR: MH_EnableHook.");
         MH_RemoveHook(target);
         MH_Uninitialize();
         return 5;
     }
 
-    Log("HOOK ACTIVE. Native behavior preserved except 30->120 quarter/three-quarter hallucinations.");
-    Log("Ctrl+Alt+I toggles filtering on/off live. Enabled=true");
+    Log("HOOK ACTIVE. Only 30->120 MS is modified.");
+    Log("DEFAULT: %s", ModeName(g_mode.load()));
+    Log("HOTKEYS: Ctrl+Alt+1 Native | 2 SoftFar | 3 ClampFar | 4 Drop75 | 5 MidpointOnly");
+    Log("Ctrl+Alt+I toggles Native <-> last modified mode.");
 
-    bool previousChord = false;
-    std::uint64_t lastCalls = 0;
-    std::uint64_t lastGap4 = 0;
-    std::uint64_t lastMid = 0;
-    std::uint64_t lastSuppressed = 0;
-    DWORD lastStatsTick = GetTickCount();
+    bool p1=false,p2=false,p3=false,p4=false,p5=false,pi=false;
+    DWORD lastStats = GetTickCount();
 
     while (g_running.load(std::memory_order_relaxed)) {
-        const bool chord =
-            (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
-            (GetAsyncKeyState(VK_MENU) & 0x8000) &&
-            (GetAsyncKeyState('I') & 0x8000);
+        const bool ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;
+        const bool alt =(GetAsyncKeyState(VK_MENU)&0x8000)!=0;
+        const bool k1=ctrl&&alt&&(GetAsyncKeyState('1')&0x8000);
+        const bool k2=ctrl&&alt&&(GetAsyncKeyState('2')&0x8000);
+        const bool k3=ctrl&&alt&&(GetAsyncKeyState('3')&0x8000);
+        const bool k4=ctrl&&alt&&(GetAsyncKeyState('4')&0x8000);
+        const bool k5=ctrl&&alt&&(GetAsyncKeyState('5')&0x8000);
+        const bool ki=ctrl&&alt&&(GetAsyncKeyState('I')&0x8000);
 
-        if (chord && !previousChord) {
-            const bool next = !g_enabled.load(std::memory_order_relaxed);
-            g_enabled.store(next, std::memory_order_relaxed);
-            Log("LIVE TOGGLE: enabled=%s", next ? "true" : "false");
+        if(k1&&!p1) SetMode(Mode::Native,"hotkey 1");
+        if(k2&&!p2) SetMode(Mode::SoftFar,"hotkey 2");
+        if(k3&&!p3) SetMode(Mode::ClampFar,"hotkey 3");
+        if(k4&&!p4) SetMode(Mode::DropFar,"hotkey 4");
+        if(k5&&!p5) SetMode(Mode::MidpointOnly,"hotkey 5");
+        if(ki&&!pi) {
+            const Mode cur=g_mode.load(std::memory_order_relaxed);
+            SetMode(cur==Mode::Native ? g_lastNonNative.load(std::memory_order_relaxed)
+                                      : Mode::Native,
+                    "A/B toggle");
         }
-        previousChord = chord;
+        p1=k1;p2=k2;p3=k3;p4=k4;p5=k5;pi=ki;
 
-        const DWORD now = GetTickCount();
-        if (now - lastStatsTick >= 5000) {
-            const auto calls = g_calls.load(std::memory_order_relaxed);
-            const auto gap4 = g_gap4Calls.load(std::memory_order_relaxed);
-            const auto mid = g_midpointPasses.load(std::memory_order_relaxed);
-            const auto suppressed = g_outerSuppressions.load(std::memory_order_relaxed);
-
-            if (calls != lastCalls || gap4 != lastGap4 ||
-                mid != lastMid || suppressed != lastSuppressed) {
-                Log("STATS calls=%llu gap4=%llu midpoint_pass=%llu outer_suppressed=%llu enabled=%s",
-                    static_cast<unsigned long long>(calls),
-                    static_cast<unsigned long long>(gap4),
-                    static_cast<unsigned long long>(mid),
-                    static_cast<unsigned long long>(suppressed),
-                    g_enabled.load(std::memory_order_relaxed) ? "true" : "false");
-                lastCalls = calls;
-                lastGap4 = gap4;
-                lastMid = mid;
-                lastSuppressed = suppressed;
-            }
-            lastStatsTick = now;
+        const DWORD now=GetTickCount();
+        if(now-lastStats>=5000) {
+            Log("STATS mode=%s calls=%llu gap4=%llu d1=%llu d2=%llu d3=%llu soft75=%llu clamp75=%llu drop75=%llu outer_drop=%llu",
+                ModeName(g_mode.load(std::memory_order_relaxed)),
+                (unsigned long long)g_calls.load(), (unsigned long long)g_gap4.load(),
+                (unsigned long long)g_d1.load(), (unsigned long long)g_d2.load(),
+                (unsigned long long)g_d3.load(), (unsigned long long)g_soft.load(),
+                (unsigned long long)g_clamp.load(), (unsigned long long)g_drop75.load(),
+                (unsigned long long)g_outerDrop.load());
+            lastStats=now;
         }
-
         Sleep(25);
     }
 
     MH_DisableHook(target);
     MH_RemoveHook(target);
     MH_Uninitialize();
-    Log("Hook disabled and MinHook shut down.");
+    Log("Hook shutdown.");
     return 0;
 }
 
 } // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        g_self = module;
+    if(reason==DLL_PROCESS_ATTACH) {
+        g_self=module;
         DisableThreadLibraryCalls(module);
-        HANDLE thread = CreateThread(nullptr, 0, ControlThread, nullptr, 0, nullptr);
-        if (thread) CloseHandle(thread);
-    } else if (reason == DLL_PROCESS_DETACH) {
-        g_running.store(false, std::memory_order_relaxed);
-        if (g_log) {
-            std::fprintf(g_log, "Process detach.\n");
-            std::fclose(g_log);
-            g_log = nullptr;
-        }
+        HANDLE t=CreateThread(nullptr,0,ControlThread,nullptr,0,nullptr);
+        if(t) CloseHandle(t);
+    } else if(reason==DLL_PROCESS_DETACH) {
+        g_running.store(false,std::memory_order_relaxed);
+        if(g_log){ std::fprintf(g_log,"Process detach.\n"); std::fclose(g_log); g_log=nullptr; }
     }
     return TRUE;
 }
